@@ -76,6 +76,22 @@ _LOW_SIGNAL_ACTION_TOOLS: frozenset[str] = frozenset({
     "web_search",
 })
 
+_RESPONSE_ONLY_MILESTONE_MARKERS: tuple[str, ...] = (
+    "send a response",
+    "send response",
+    "send the response",
+    "send a modal",
+    "show a modal",
+    "show the modal",
+    "product modal",
+    "deliver to the user",
+    "sent to the user",
+    "sent to user",
+    "via send_response",
+    "response is sent",
+    "modal is sent",
+)
+
 _AWAIT_REPLY_SENTINEL = "AWAIT_REPLY:"
 
 _FAILED_UI_RESULT_MARKERS: frozenset[str] = frozenset({
@@ -126,8 +142,10 @@ CRITICAL RULES:
 5. For browser interactions: always perceive before acting. Read content before interacting.
 5a. For web research, prefer `get_web_information(...)` over raw mechanism choices. It can search, choose a promising result, follow it in the browser, and then return page content/summary/structured items in one call when you provide a `query` with `target_type=page_content|page_summary|structured_data`. Use `target_type=search_results` only when you explicitly need the result list itself.
 5b. After you get usable search results, FOLLOW THEM. Do not issue another similar search if you already have relevant result URLs. Open or read one of the authoritative sources next.
-6. For writing tools (gdocs_create, gdocs_append): set "title" only. Body content is
-   synthesized automatically from collected research. NEVER set "body" or "text".
+6. For writing tools (gdocs_create, gdocs_append): prefer setting "title" only when the
+   document content can be synthesized from prior research or from the task itself.
+   Only provide "body" or "text" directly if you already have concrete content that must
+   be preserved verbatim.
 7. NEVER fabricate data. If you need information, search/read for it first.
 8. Output ONLY valid JSON — no markdown, no explanation outside the JSON.
 9. Each action should make meaningful progress. Avoid repeating failed actions identically.
@@ -648,6 +666,15 @@ class MilestoneExecutor:
                 milestone.result_summary = result_str[:500]
                 return False, _AWAIT_REPLY_SENTINEL + json.dumps(payload, ensure_ascii=False)
 
+            if tool == "send_response" and success and self._is_response_only_milestone(milestone):
+                milestone.actions_taken = action_num + 1
+                milestone.result_summary = self._send_response_completion_summary(
+                    milestone=milestone,
+                    args=args,
+                    result_text=result_str,
+                )
+                return True, milestone.result_summary
+
             action_num += 1
             continue_running, next_stall_warning = self._detect_stall(actions)
             if not continue_running:
@@ -677,6 +704,22 @@ class MilestoneExecutor:
             return json.dumps(args or {}, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         except Exception:
             return str(args or {})
+
+    def _is_response_only_milestone(self, milestone: Milestone) -> bool:
+        text = f"{milestone.goal or ''} {milestone.success_signal or ''}".lower()
+        hint_tools = {str(tool).strip() for tool in (milestone.hint_tools or []) if str(tool).strip()}
+        non_response_hints = hint_tools.difference({"send_response"})
+        return bool(text) and any(marker in text for marker in _RESPONSE_ONLY_MILESTONE_MARKERS) and not non_response_hints
+
+    def _send_response_completion_summary(self, milestone: Milestone, args: dict, result_text: str) -> str:
+        modal = str((args or {}).get("modal", "")).strip().lower()
+        if modal in {"cards", "products"}:
+            return "Product modal sent to user."
+        if modal:
+            return f"{modal.title()} modal sent to user."
+        if result_text:
+            return str(result_text).strip()[:500]
+        return "Response sent to user."
 
     def _search_retry_key(self, tool: str, args: dict) -> str:
         if tool != "get_web_information":

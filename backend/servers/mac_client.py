@@ -94,8 +94,8 @@ class VoiceProcessor:
         # Initialize Porcupine
         try:
             if PICOVOICE_ACCESS_KEY and PICOVOICE_ACCESS_KEY != "YOUR_KEY_HERE":
-                base_dir = os.path.dirname(os.path.abspath(__file__))
-                custom_ppn = os.path.join(base_dir, "hey_moonwalk.ppn")
+                project_root = os.path.abspath(os.path.join(_backend_dir, ".."))
+                custom_ppn = os.path.join(project_root, "hey_moonwalk.ppn")
                 if os.path.exists(custom_ppn):
                     self.porcupine = pvporcupine.create(
                         access_key=PICOVOICE_ACCESS_KEY,

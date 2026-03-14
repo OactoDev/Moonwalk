@@ -34,6 +34,7 @@ import time
 import webbrowser
 from typing import Optional, List
 
+from runtime_state import runtime_state_store
 from tools.registry import registry, _osascript
 
 
@@ -42,6 +43,7 @@ from tools.registry import registry, _osascript
 # ═══════════════════════════════════════════════════════════════
 
 _TOKEN_PATH = os.path.expanduser("~/.moonwalk/gcloud_token.json")
+_VISION_COORD_RE = re.compile(r"\(?\b(?:x\s*[:=]\s*)?(\d{1,4})\s*,\s*(?:y\s*[:=]\s*)?(\d{1,4})\b\)?", re.I)
 
 
 def _load_token() -> Optional[str]:
@@ -304,6 +306,179 @@ async def _paste_html(text: str) -> str:
     )
 
 
+async def _wait_for_gdocs_ready(timeout: float = 15.0) -> dict:
+    started = time.time()
+    while time.time() - started < timeout:
+        snapshot = await _gdocs_state_via_bridge()
+        if snapshot.get("url", "").startswith("https://docs.google.com/document/d/"):
+            return snapshot
+        await asyncio.sleep(0.5)
+    return {}
+
+
+async def _gdocs_state_via_bridge() -> dict:
+    raw = await _bridge_extract("gdocs_state", timeout=4.0)
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+async def _gdocs_set_title(title: str) -> bool:
+    if not title:
+        return True
+    title_b64 = __import__("base64").b64encode(title.encode("utf-8")).decode("ascii")
+    result = await _bridge_extract(f"gdocs_set_title:{title_b64}", timeout=4.0)
+    return bool(result and title in result)
+
+
+async def _gdocs_focus_editor() -> bool:
+    result = await _bridge_extract("gdocs_focus_editor", timeout=4.0)
+    if result and result.strip():
+        click_result = await _bridge_extract("gdocs_click_editor", timeout=4.0)
+        if click_result and click_result.strip():
+            return True
+    await _osascript('tell application "Google Chrome" to activate')
+    await asyncio.sleep(0.1)
+    await _osascript('tell application "System Events" to keystroke "f6"')
+    await asyncio.sleep(0.2)
+    await _osascript('tell application "System Events" to key code 48')
+    await asyncio.sleep(0.2)
+    click_result = await _bridge_extract("gdocs_click_editor", timeout=4.0)
+    if click_result and click_result.strip():
+        return True
+    return True
+
+
+def _normalize_doc_text(text: str) -> str:
+    return " ".join(str(text or "").split()).strip().lower()
+
+
+def _extract_doc_id_from_url(url: str) -> str:
+    match = re.search(r"/document/d/([a-zA-Z0-9_-]{20,})", str(url or ""))
+    return match.group(1) if match else ""
+
+
+async def _gdocs_read_body() -> str:
+    raw = await _bridge_extract("gdocs_read_body", timeout=4.0)
+    if raw and len(_normalize_doc_text(raw)) >= 12:
+        return raw
+    await _gdocs_focus_editor()
+    await asyncio.sleep(0.2)
+    return await _copy_text()
+
+
+def _body_matches_expected(actual: str, expected: str) -> bool:
+    actual_norm = _normalize_doc_text(actual)
+    expected_norm = _normalize_doc_text(expected)
+    if not expected_norm:
+        return True
+    if not actual_norm:
+        return False
+    if expected_norm[:120] and expected_norm[:120] in actual_norm:
+        return True
+    expected_tokens = [token for token in re.split(r"[^a-z0-9]+", expected_norm) if len(token) > 4]
+    if not expected_tokens:
+        return len(actual_norm) >= min(40, len(expected_norm))
+    overlap = sum(1 for token in expected_tokens[:12] if token in actual_norm)
+    return overlap >= min(4, max(2, len(expected_tokens[:12]) // 3))
+
+
+async def _gdocs_replace_body(body: str) -> bool:
+    if not body:
+        return True
+    await _osascript('tell application "Google Chrome" to activate')
+    await _gdocs_focus_editor()
+    await asyncio.sleep(0.2)
+    await _osascript('tell application "System Events" to keystroke "a" using command down')
+    await asyncio.sleep(0.15)
+    await _paste_html(body)
+    await asyncio.sleep(0.8)
+    readback = await _gdocs_read_body()
+    if _body_matches_expected(readback, body):
+        return True
+
+    if await _gdocs_focus_editor_with_vision():
+        await asyncio.sleep(0.2)
+        await _osascript('tell application "System Events" to keystroke "a" using command down')
+        await asyncio.sleep(0.15)
+        await _paste_html(body)
+        await asyncio.sleep(0.8)
+        readback = await _gdocs_read_body()
+        if _body_matches_expected(readback, body):
+            return True
+
+    return False
+
+
+async def _open_gdoc_url(url: str) -> dict:
+    await _osascript('tell application "Google Chrome" to activate')
+    if url:
+        await _osascript(f'tell application "Google Chrome" to open location "{url}"')
+        await asyncio.sleep(0.8)
+    return await _wait_for_gdocs_ready(timeout=18.0)
+
+
+async def _gdocs_append_body(text: str) -> bool:
+    if not text:
+        return True
+    await _osascript('tell application "Google Chrome" to activate')
+    await _gdocs_focus_editor()
+    await asyncio.sleep(0.2)
+    await _osascript('tell application "System Events" to key code 119 using command down')
+    await asyncio.sleep(0.25)
+    await _paste_html("\n" + text)
+    await asyncio.sleep(0.8)
+    readback = await _gdocs_read_body()
+    if _body_matches_expected(readback, text):
+        return True
+
+    if await _gdocs_focus_editor_with_vision():
+        await asyncio.sleep(0.2)
+        await _osascript('tell application "System Events" to key code 119 using command down')
+        await asyncio.sleep(0.25)
+        await _paste_html("\n" + text)
+        await asyncio.sleep(0.8)
+        readback = await _gdocs_read_body()
+        if _body_matches_expected(readback, text):
+            return True
+
+    return False
+
+
+def _extract_visual_coordinates(screen_result: str) -> tuple[int, int] | None:
+    match = _VISION_COORD_RE.search(str(screen_result or ""))
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+async def _gdocs_focus_editor_with_vision() -> bool:
+    prompt = (
+        "Find the main writable Google Docs page area where pasted document text should go. "
+        "Return one precise coordinate pair like (x, y) near the center of the writable page, "
+        "not the toolbar, title field, comments, or sidebar."
+    )
+    try:
+        screen_result = await registry.execute("read_screen", {"question": prompt})
+    except Exception:
+        return False
+
+    coords = _extract_visual_coordinates(screen_result)
+    if not coords:
+        return False
+
+    x, y = coords
+    try:
+        click_result = await registry.execute("click_element", {"x": x, "y": y})
+    except Exception:
+        return False
+
+    return "failed" not in str(click_result or "").lower()
+
+
 # ═══════════════════════════════════════════════════════════════
 #  Google Docs Tools
 # ═══════════════════════════════════════════════════════════════
@@ -346,17 +521,61 @@ async def gdocs_create(title: str, body: str = "") -> str:
                         body={"requests": requests}, token=token)
         url = f"https://docs.google.com/document/d/{doc_id}/edit"
         webbrowser.open(url)
+        runtime_state_store.update_request_state(active_doc_url=url)
         return json.dumps({"ok": True, "doc_id": doc_id, "url": url,
                            "body_length": len(body)})
 
-    # ── Fallback: open blank doc and paste as HTML ──
-    webbrowser.open("https://docs.new")
-    await asyncio.sleep(3.0)
+    # ── Fallback: reuse the current request doc when possible, otherwise create one ──
+    prior_doc_url = str(runtime_state_store.snapshot().request_state.active_doc_url or "")
+    target_url = prior_doc_url if prior_doc_url.startswith("https://docs.google.com/document/d/") else "https://docs.new"
+    doc_state = await _open_gdoc_url(target_url)
+    if not doc_state:
+        return json.dumps({
+            "ok": False,
+            "url": target_url,
+            "note": "Google Docs did not become ready in the browser.",
+            "error_code": "gdocs_not_ready",
+            "repairable": False,
+        })
+
+    title_ok = await _gdocs_set_title(title)
+    await asyncio.sleep(0.4)
+
+    body_ok = True
+    readback = ""
     if body:
-        await _paste_html(body)
-    return json.dumps({"ok": True, "url": "https://docs.new",
-                       "note": "Opened a new Google Doc. Content pasted as HTML via clipboard.",
-                       "body_length": len(body)})
+        body_ok = await _gdocs_replace_body(body)
+        readback = await _gdocs_read_body()
+        post_state = await _gdocs_state_via_bridge()
+        body_ok = body_ok or _body_matches_expected(readback, body)
+        doc_state = post_state or doc_state
+
+    url = str(doc_state.get("url", "") or "https://docs.new")
+    runtime_state_store.update_request_state(active_doc_url=url)
+    doc_id = _extract_doc_id_from_url(url)
+    if title_ok and body_ok:
+        return json.dumps({
+            "ok": True,
+            "url": url,
+            "doc_id": doc_id,
+            "note": "Opened a new Google Doc and applied the requested title/content.",
+            "title_applied": True,
+            "body_applied": True,
+            "body_length": len(body),
+            "repairable": False,
+        })
+
+    return json.dumps({
+        "ok": False,
+        "url": url,
+        "doc_id": doc_id,
+        "note": "Google Doc opened, but title or body was not applied reliably.",
+        "error_code": "gdocs_apply_failed",
+        "title_applied": bool(title_ok),
+        "body_applied": bool(body_ok),
+        "body_length": len(body),
+        "repairable": bool(url.startswith("https://docs.google.com/document/d/")),
+    })
 
 
 @registry.register(
@@ -478,13 +697,30 @@ async def gdocs_append(doc_url_or_id: str, text: str) -> str:
                            "appended_chars": len(text),
                            "api_result": str(result)[:500]})
 
-    # Fallback: Cmd+End then paste as HTML
-    await _osascript('tell application "System Events" to key code 119 using command down')
-    await asyncio.sleep(0.3)
-    await _paste_html("\n" + text)
-    return json.dumps({"ok": True, "doc_id": doc_id,
-                       "appended_chars": len(text),
-                       "method": "keyboard_paste_html"})
+    doc_url = str(doc_url_or_id or "").strip()
+    if doc_id and not doc_url.startswith("http"):
+        doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
+
+    doc_state = await _open_gdoc_url(doc_url)
+    if not doc_state:
+        return json.dumps({
+            "ok": False,
+            "doc_id": doc_id,
+            "url": doc_url,
+            "note": "Google Doc did not become ready for append.",
+            "error_code": "gdocs_not_ready",
+        })
+
+    appended = await _gdocs_append_body(text)
+    final_url = str(doc_state.get("url", "") or doc_url)
+    return json.dumps({
+        "ok": bool(appended),
+        "doc_id": doc_id or _extract_doc_id_from_url(final_url),
+        "url": final_url,
+        "appended_chars": len(text),
+        "method": "keyboard_paste_html",
+        "error_code": "" if appended else "gdocs_append_failed",
+    })
 
 
 @registry.register(

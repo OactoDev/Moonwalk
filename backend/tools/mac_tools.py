@@ -672,9 +672,10 @@ async def set_volume(level: int) -> str:
         "  Provide `steps` (list of {label, status: done|current|pending, detail?}).\n"
         "- **plan**: present a plan to the user BEFORE executing. Uses `await_reply` internally. "
         "  Provide `steps` (list of {label, detail?}). The user can approve, modify, or cancel.\n"
-        "- **products**: display product cards in a grid. "
-        "  Provide `products` (list of {name, price, image?, rating?, reviews?, original_price?, source?, url?, description?}). "
-        "  Optionally add `context` {title, summary, highlights: [{icon, text}]} for a sidebar panel with analysis."
+        "- **cards**: display image+text cards for products, homes, articles, and visual results. "
+        "  Provide `cards` (list of {name/title, description?, image?, price?, rating?, reviews?, original_price?, source?, url/link?, link_label?}). "
+        "  Optionally add `title`, `subtitle`, and `context` {title, summary, highlights: [{icon, text}]}. "
+        "  Legacy `modal='products'` with `products` is still accepted for backward compatibility."
     ),
     parameters={
         "type": "object",
@@ -685,12 +686,16 @@ async def set_volume(level: int) -> str:
             },
             "modal": {
                 "type": "string",
-                "enum": ["text", "rich", "table", "list", "confirm", "media", "steps", "plan", "products"],
+                "enum": ["text", "rich", "table", "list", "confirm", "media", "steps", "plan", "cards", "products"],
                 "description": "The modal layout to use (default: 'text')"
             },
             "title": {
                 "type": "string",
-                "description": "Title for rich/table/list/steps/plan/products modals"
+                "description": "Title for rich/table/list/steps/plan/cards modals"
+            },
+            "subtitle": {
+                "type": "string",
+                "description": "Optional subtitle for cards/products modals"
             },
             "headers": {
                 "type": "array",
@@ -748,6 +753,31 @@ async def set_volume(level: int) -> str:
                 },
                 "description": "Step items for steps/plan modal. For plan modal, status is ignored (steps are shown as numbered items)."
             },
+            "cards": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "title": {"type": "string"},
+                        "price": {"type": "string"},
+                        "image": {"type": "string"},
+                        "rating": {"type": "number"},
+                        "reviews": {"type": "string"},
+                        "original_price": {"type": "string"},
+                        "source": {"type": "string"},
+                        "url": {"type": "string"},
+                        "link": {"type": "string"},
+                        "link_label": {"type": "string"},
+                        "description": {"type": "string", "description": "Short card description (1-2 lines)"}
+                    },
+                    "anyOf": [
+                        {"required": ["name"]},
+                        {"required": ["title"]}
+                    ]
+                },
+                "description": "Card items for cards modal. Preferred over legacy `products`."
+            },
             "products": {
                 "type": "array",
                 "items": {
@@ -765,7 +795,7 @@ async def set_volume(level: int) -> str:
                     },
                     "required": ["name"]
                 },
-                "description": "Product cards for products modal"
+                "description": "Legacy alias for cards modal data. Accepted for backward compatibility."
             },
             "context": {
                 "type": "object",
@@ -796,9 +826,10 @@ async def set_volume(level: int) -> str:
                 "items": {
                     "type": "object",
                     "properties": {
-                        "modal": {"type": "string", "enum": ["text", "rich", "table", "list", "confirm", "media", "steps", "plan", "products"]},
+                        "modal": {"type": "string", "enum": ["text", "rich", "table", "list", "confirm", "media", "steps", "plan", "cards", "products"]},
                         "message": {"type": "string"},
                         "title": {"type": "string"},
+                        "subtitle": {"type": "string"},
                         "headers": {"type": "array", "items": {"type": "string"}},
                         "rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
                         "items": {"type": "array", "items": {"type": "object", "properties": {"title": {"type": "string"}, "description": {"type": "string"}, "icon": {"type": "string"}}, "required": ["title"]}},
@@ -807,6 +838,7 @@ async def set_volume(level: int) -> str:
                         "caption": {"type": "string"},
                         "plan_id": {"type": "string"},
                         "steps": {"type": "array", "items": {"type": "object", "properties": {"label": {"type": "string"}, "status": {"type": "string"}, "detail": {"type": "string"}}, "required": ["label"]}},
+                        "cards": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "title": {"type": "string"}, "price": {"type": "string"}, "image": {"type": "string"}, "rating": {"type": "number"}, "url": {"type": "string"}, "link": {"type": "string"}, "link_label": {"type": "string"}, "description": {"type": "string"}}, "anyOf": [{"required": ["name"]}, {"required": ["title"]}]}},
                         "products": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "price": {"type": "string"}, "image": {"type": "string"}, "rating": {"type": "number"}, "url": {"type": "string"}, "description": {"type": "string"}}, "required": ["name"]}}
                     },
                     "required": ["modal", "message"]
@@ -821,6 +853,7 @@ async def send_response(
     message: str = "",
     modal: str = "text",
     title: str = "",
+    subtitle: str = "",
     headers: list = None,
     rows: list = None,
     items: list = None,
@@ -828,6 +861,7 @@ async def send_response(
     media_url: str = "",
     caption: str = "",
     steps: list = None,
+    cards: list = None,
     products: list = None,
     context: dict = None,
     plan_id: str = "",
@@ -850,6 +884,8 @@ async def send_response(
         payload["plan_id"] = plan_id
     if title:
         payload["title"] = title
+    if subtitle:
+        payload["subtitle"] = subtitle
     if headers:
         payload["headers"] = headers
     if rows:
@@ -864,6 +900,9 @@ async def send_response(
         payload["caption"] = caption
     if steps:
         payload["steps"] = steps
+    normalized_cards = cards or products
+    if normalized_cards:
+        payload["cards"] = normalized_cards
     if products:
         payload["products"] = products
     if context:
@@ -889,10 +928,11 @@ async def send_response(
             },
             "modal": {
                 "type": "string",
-                "enum": ["text", "rich", "table", "list", "confirm", "media", "steps", "plan", "products"],
+                "enum": ["text", "rich", "table", "list", "confirm", "media", "steps", "plan", "cards", "products"],
                 "description": "The modal layout to use (default: 'text')"
             },
             "title": {"type": "string", "description": "Title for the modal"},
+            "subtitle": {"type": "string", "description": "Optional subtitle for cards/products modal"},
             "headers": {"type": "array", "items": {"type": "string"}, "description": "Column headers for table"},
             "rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}, "description": "Rows for table"},
             "items": {
@@ -928,6 +968,31 @@ async def send_response(
                 },
                 "description": "Steps for steps/plan modal"
             },
+            "cards": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "title": {"type": "string"},
+                        "price": {"type": "string"},
+                        "image": {"type": "string"},
+                        "rating": {"type": "number"},
+                        "reviews": {"type": "string"},
+                        "original_price": {"type": "string"},
+                        "source": {"type": "string"},
+                        "url": {"type": "string"},
+                        "link": {"type": "string"},
+                        "link_label": {"type": "string"},
+                        "description": {"type": "string"}
+                    },
+                    "anyOf": [
+                        {"required": ["name"]},
+                        {"required": ["title"]}
+                    ]
+                },
+                "description": "Card items for cards modal. Preferred over legacy `products`."
+            },
             "products": {
                 "type": "array",
                 "items": {
@@ -945,7 +1010,7 @@ async def send_response(
                     },
                     "required": ["name"]
                 },
-                "description": "Product cards for products modal"
+                "description": "Legacy alias for cards modal data."
             },
             "context": {
                 "type": "object",
@@ -969,11 +1034,20 @@ async def send_response(
                 "items": {
                     "type": "object",
                     "properties": {
-                        "modal": {"type": "string", "enum": ["text", "rich", "table", "list", "confirm", "media", "steps", "plan", "products"]},
+                        "modal": {"type": "string", "enum": ["text", "rich", "table", "list", "confirm", "media", "steps", "plan", "cards", "products"]},
                         "message": {"type": "string"},
                         "title": {"type": "string"},
+                        "subtitle": {"type": "string"},
+                        "headers": {"type": "array", "items": {"type": "string"}},
+                        "rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+                        "items": {"type": "array", "items": {"type": "object", "properties": {"title": {"type": "string"}, "description": {"type": "string"}, "icon": {"type": "string"}}, "required": ["title"]}},
+                        "actions": {"type": "array", "items": {"type": "object", "properties": {"label": {"type": "string"}, "value": {"type": "string"}}, "required": ["label", "value"]}},
+                        "media_url": {"type": "string"},
+                        "caption": {"type": "string"},
                         "plan_id": {"type": "string"},
-                        "steps": {"type": "array", "items": {"type": "object", "properties": {"label": {"type": "string"}, "status": {"type": "string"}, "detail": {"type": "string"}}, "required": ["label"]}}
+                        "steps": {"type": "array", "items": {"type": "object", "properties": {"label": {"type": "string"}, "status": {"type": "string"}, "detail": {"type": "string"}}, "required": ["label"]}},
+                        "cards": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "title": {"type": "string"}, "price": {"type": "string"}, "image": {"type": "string"}, "rating": {"type": "number"}, "url": {"type": "string"}, "link": {"type": "string"}, "link_label": {"type": "string"}, "description": {"type": "string"}}, "anyOf": [{"required": ["name"]}, {"required": ["title"]}]}},
+                        "products": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "price": {"type": "string"}, "image": {"type": "string"}, "rating": {"type": "number"}, "url": {"type": "string"}, "description": {"type": "string"}}, "required": ["name"]}}
                     },
                     "required": ["modal", "message"]
                 },
@@ -987,6 +1061,7 @@ async def await_reply(
     message: str = "",
     modal: str = "text",
     title: str = "",
+    subtitle: str = "",
     headers: list = None,
     rows: list = None,
     items: list = None,
@@ -994,6 +1069,7 @@ async def await_reply(
     media_url: str = "",
     caption: str = "",
     steps: list = None,
+    cards: list = None,
     products: list = None,
     context: dict = None,
     plan_id: str = "",
@@ -1016,6 +1092,8 @@ async def await_reply(
         payload["plan_id"] = plan_id
     if title:
         payload["title"] = title
+    if subtitle:
+        payload["subtitle"] = subtitle
     if headers:
         payload["headers"] = headers
     if rows:
@@ -1030,6 +1108,9 @@ async def await_reply(
         payload["caption"] = caption
     if steps:
         payload["steps"] = steps
+    normalized_cards = cards or products
+    if normalized_cards:
+        payload["cards"] = normalized_cards
     if products:
         payload["products"] = products
     if context:

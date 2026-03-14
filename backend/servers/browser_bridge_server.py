@@ -100,7 +100,9 @@ def _snapshot_from_payload(payload: Dict[str, Any]) -> PageSnapshot:
 
 
 def _action_result_from_payload(payload: Dict[str, Any]) -> ActionResult:
-    details = {str(key): str(value) for key, value in dict(payload.get("details", {}) or {}).items()}
+    details = dict(payload.get("details", {}) or {})
+    error = dict(payload.get("error", {}) or {})
+    meta = dict(payload.get("meta", {}) or {})
     return ActionResult(
         ok=bool(payload.get("ok", False)),
         message=str(payload.get("message", "")),
@@ -111,6 +113,8 @@ def _action_result_from_payload(payload: Dict[str, Any]) -> ActionResult:
         pre_generation=int(payload.get("pre_generation", 0) or 0),
         post_generation=int(payload.get("post_generation", 0) or 0),
         details=details,
+        error=error,
+        meta=meta,
     )
 
 

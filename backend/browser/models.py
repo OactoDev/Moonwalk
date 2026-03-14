@@ -104,7 +104,9 @@ class ActionResult:
     session_id: str = ""
     pre_generation: int = 0
     post_generation: int = 0
-    details: Dict[str, str] = field(default_factory=dict)
+    details: Dict[str, Any] = field(default_factory=dict)
+    error: Dict[str, Any] = field(default_factory=dict)
+    meta: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

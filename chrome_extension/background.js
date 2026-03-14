@@ -33,7 +33,7 @@ function isInjectableUrl(url) {
 async function ensureContentScript(tabId) {
   await chrome.scripting.executeScript({
     target: { tabId },
-    files: ["content_script.js"],
+    files: ["Readability.js", "content_script.js"],
   });
 }
 
@@ -224,12 +224,58 @@ async function executeActionOnTab(action) {
       );
     }
 
+    if (action?.action === "extract_readability") {
+      const readabilityResult = await chrome.tabs.sendMessage(tab.id, {
+        type: "moonwalk_extract_readability",
+        sessionId: action?.session_id || sessionId,
+        tabId: String(tab.id),
+      });
+      return buildActionResult(
+        action,
+        !!readabilityResult?.ok,
+        readabilityResult?.message || (readabilityResult?.ok ? "Readability extraction successful." : "Readability extraction failed."),
+        metadata,
+        {
+          tab_id: String(tab.id),
+          result: JSON.stringify(readabilityResult || {}),
+          error: readabilityResult?.error || "",
+        },
+        Date.now(),
+      );
+    }
+
+    // ── Click pointer: show agent cursor before click actions ──
+    const isClickLike = ["click", "type", "fill", "select"].includes(action?.action);
+    if (isClickLike && action?.ref_id) {
+      try {
+        const snapshot = latestSnapshotByTab.get(tab.id) || [...latestSnapshotByTab.values()].slice(-1)[0];
+        if (snapshot?.elements) {
+          const el = snapshot.elements.find(e => e.ref_id === action.ref_id);
+          const b = el?.bounds;
+          if (b && (b.width > 0 || b.height > 0)) {
+            const pageX = (b.x || 0) + (b.width || 0) / 2;
+            const pageY = (b.y || 0) + (b.height || 0) / 2;
+            chrome.tabs.sendMessage(tab.id, {
+              type: "moonwalk_show_click_pointer",
+              pageX,
+              pageY,
+            }).catch(() => {});
+          }
+        }
+      } catch (_) {}
+    }
+
     const result = await chrome.tabs.sendMessage(tab.id, {
       type: "moonwalk_execute_action",
       action,
       sessionId: action?.session_id || sessionId,
       tabId: String(tab.id),
     });
+
+    // After a successful click, fire the burst animation
+    if (result?.ok && isClickLike) {
+      chrome.tabs.sendMessage(tab.id, { type: "moonwalk_trigger_click_burst" }).catch(() => {});
+    }
 
     // After a successful action, request a fresh snapshot so the backend
     // gets the post-action DOM state quickly. The content script's
@@ -260,6 +306,7 @@ async function executeActionOnTab(action) {
 }
 
 function buildActionResult(action, ok, message, metadata, details, postGen) {
+  const errorCode = ok ? "" : String(details?.error_code || details?.reason || "bridge.action_failed");
   return {
     ok,
     message,
@@ -270,6 +317,18 @@ function buildActionResult(action, ok, message, metadata, details, postGen) {
     pre_generation: Number(metadata?.generation || 0),
     post_generation: postGen ?? Number(metadata?.generation || 0),
     details: details || {},
+    error: ok ? null : {
+      code: errorCode,
+      message,
+      retryable: false,
+      degraded: false,
+      source: "bridge.background",
+      details: details || {},
+    },
+    meta: {
+      session_id: action?.session_id || sessionId,
+      provenance: "chrome_extension",
+    },
   };
 }
 

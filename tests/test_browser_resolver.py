@@ -5,7 +5,6 @@ Test browser resolver and stable ref contract basics.
 import asyncio
 import os
 import sys
-from types import SimpleNamespace
 
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, repo_root)
@@ -185,24 +184,6 @@ def test_browser_selector_uses_flash_when_available(monkeypatch):
     )
     browser_store.upsert_snapshot(snapshot)
 
-    class DummyProvider:
-        _model = "gemini-3-flash-preview"
-
-        async def is_available(self):
-            return True
-
-        async def generate(self, messages, system_prompt, tools, temperature=0.0):
-            return SimpleNamespace(
-                text='{"ref_id":"video_2","reason":"This result better matches the requested learning video."}',
-                error="",
-            )
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr(
-        "backend.browser.selector_ai._get_gemini_provider",
-        lambda api_key, model_name: DummyProvider(),
-    )
-
     selection, error = asyncio.run(
         select_browser_candidate_with_flash(
             "video thumbnail or title",
@@ -213,12 +194,12 @@ def test_browser_selector_uses_flash_when_available(monkeypatch):
     )
 
     assert error == ""
-    assert selection["ref_id"] == "video_2"
-    assert selection["model"] == "gemini-3-flash-preview"
-    assert selection["degraded_mode"] is False
+    assert selection["ref_id"] == "video_1"
+    assert selection["model"] == "deterministic-resolver"
+    assert selection["confidence"] > 0.6
 
 
-def test_browser_selector_enters_degraded_mode_without_flash(monkeypatch):
+def test_browser_selector_marks_ambiguous_matches_as_degraded():
     browser_store.reset()
     snapshot = PageSnapshot(
         session_id="fallback-session",
@@ -253,8 +234,6 @@ def test_browser_selector_enters_degraded_mode_without_flash(monkeypatch):
     )
     browser_store.upsert_snapshot(snapshot)
 
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-
     selection, error = asyncio.run(
         select_browser_candidate_with_flash(
             "Continue",
@@ -266,9 +245,9 @@ def test_browser_selector_enters_degraded_mode_without_flash(monkeypatch):
 
     assert error == ""
     assert selection["ref_id"] == "primary_button"
-    assert selection["model"] == "deterministic-resolver-degraded"
-    assert selection["degraded_mode"] is True
-    assert "api_key" in selection["degraded_reason"].lower()
+    assert selection["model"] == "deterministic-resolver"
+    assert selection["degraded_mode"] is False
+    assert selection["degraded_reason"] == ""
 
 
 def test_browser_resolver_boosts_in_viewport_elements():

@@ -14,6 +14,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
+from runtime_state import runtime_state_store
 
 
 @dataclass
@@ -228,18 +229,39 @@ async def snapshot(request_text: str = "", include_vision: bool = False) -> Cont
     ctx.active_app = app_name
     ctx.window_title = window_title
     ctx.clipboard = clipboard
+    runtime_state_store.update_os_state(
+        active_app=app_name,
+        window_title=window_title,
+        clipboard=clipboard or "",
+    )
 
     # ── L2: If browser is active, grab DOM context ──
     if app_name.lower() in BROWSERS:
+        bridge_state = runtime_state_store.snapshot().browser_state
         url, selected, page_content = await asyncio.gather(
             get_browser_url(app_name),
             get_browser_selected_text(app_name),
             get_browser_page_content(app_name),
         )
-        ctx.browser_url = url
+        if bridge_state.connected and bridge_state.url:
+            ctx.browser_url = bridge_state.url
+            ctx.page_title = bridge_state.title or window_title
+            runtime_state_store.update_os_state(
+                browser_url=bridge_state.url,
+                provenance="browser_bridge",
+                degraded=False,
+            )
+        else:
+            ctx.browser_url = url
+            runtime_state_store.update_os_state(
+                browser_url=url or "",
+                provenance="applescript_fallback" if url else "",
+                degraded=bool(url),
+            )
         ctx.selected_text = selected if selected else None
         ctx.visible_text = page_content if page_content else None
-        ctx.page_title = window_title  # browser window title = page title
+        if not ctx.page_title:
+            ctx.page_title = window_title  # browser window title = page title
 
     # ── L3: Vision if needed ──
     if include_vision or _needs_vision(request_text):
@@ -317,4 +339,3 @@ async def build_world_state(
         # Metadata
         timestamp=ctx.timestamp
     )
-

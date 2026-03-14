@@ -19,6 +19,15 @@ from agent.planner import Milestone, MilestoneStatus
 from multi_agent import SubAgentConfig, SubAgentResult, SubAgentStatus
 
 
+def _is_suspend_signal(exc: Exception) -> bool:
+    """Detect await-reply suspension signals without importing agent internals."""
+    return (
+        hasattr(exc, "suspended_milestone_id")
+        and hasattr(exc, "await_payload")
+        and hasattr(exc, "await_data")
+    )
+
+
 class RemoteExecutor:
     """
     Runs milestones as an isolated sub-agent.
@@ -158,6 +167,8 @@ class RemoteExecutor:
                     )
 
             except Exception as e:
+                if _is_suspend_signal(e):
+                    raise
                 milestone.status = MilestoneStatus.FAILED
                 milestone.error = str(e)
                 failed += 1

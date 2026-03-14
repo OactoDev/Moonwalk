@@ -28,6 +28,8 @@ _UI_MUTATING_TOOLS: frozenset[str] = frozenset({
     "browser_click_match", "find_and_act",
     # App lifecycle
     "open_app", "open_url", "quit_app", "close_window",
+    # Google Workspace mutating actions
+    "gdocs_create", "gdocs_write", "gsheets_write", "gcal_create_event",
 })
 
 _READ_ONLY_TOOLS: frozenset[str] = frozenset({
@@ -127,6 +129,7 @@ class ToolVerifier:
             "web_search": self._verify_web_search,
             "get_web_information": self._verify_get_web_information,
             "gdocs_create": self._verify_gdocs_create,
+            "gdocs_append": self._verify_gdocs_append,
             "browser_assert": self._verify_browser_assert,
             "browser_wait_for": self._verify_browser_assert,
             "run_shell": self._verify_run_shell,
@@ -230,6 +233,9 @@ class ToolVerifier:
 
         # Step 2: if read-only tool, skip visual verification entirely
         if tool_name in _READ_ONLY_TOOLS:
+            return string_result
+
+        if tool_name == "gdocs_create" and string_result.success:
             return string_result
 
         # Step 3: if UI-mutating tool, run visual verification
@@ -1684,6 +1690,14 @@ class ToolVerifier:
                     message=f"Google Doc created: {url}"
                 )
             if data.get("ok") is False:
+                if data.get("repairable") and data.get("url"):
+                    return VerificationResult(
+                        success=False,
+                        confidence=0.92,
+                        message=f"Google Doc content application failed: {data.get('note', 'unknown error')}",
+                        should_retry=True,
+                        suggested_fix="Retry the write on the same Google Doc instead of creating a new one.",
+                    )
                 return VerificationResult(
                     success=False,
                     confidence=0.9,
@@ -1692,6 +1706,41 @@ class ToolVerifier:
                 )
 
         return VerificationResult(success=True, confidence=0.7, message="gdocs_create completed")
+
+    async def _verify_gdocs_append(
+        self,
+        args: Dict[str, Any],
+        result: str,
+        criteria: str,
+        get_state: Optional[Callable]
+    ) -> VerificationResult:
+        import json as _json
+        try:
+            data = _json.loads(result)
+        except (TypeError, ValueError):
+            data = {}
+
+        if isinstance(data, dict):
+            if data.get("ok") is True and data.get("appended_chars", 0):
+                return VerificationResult(
+                    success=True,
+                    confidence=0.9,
+                    message=f"Google Doc updated: {data.get('url', data.get('doc_id', 'document'))}",
+                )
+            if data.get("ok") is False:
+                return VerificationResult(
+                    success=False,
+                    confidence=0.92,
+                    message=f"Google Doc append failed: {data.get('note', data.get('error_code', 'unknown error'))}",
+                    should_retry=True,
+                )
+
+        return VerificationResult(
+            success=False,
+            confidence=0.8,
+            message="gdocs_append result was unclear",
+            should_retry=True,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════

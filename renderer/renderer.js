@@ -27,13 +27,17 @@ const bridge = window.overlayAPI || {
 
 /* ── DOM Refs ── */
 const wrapper = document.getElementById("ui-wrapper");
-const uiSpeech = document.getElementById("ui-speech");
+const uiIdle = document.getElementById("ui-idle");
+const uiListening = document.getElementById("ui-listening");
 const uiLoading = document.getElementById("ui-loading");
 const uiDoing = document.getElementById("ui-doing");
+const glow = document.getElementById("glow");
 const uiResponse = document.getElementById("ui-response");
 const statusEl = document.getElementById("status-text");
 const doingTextEl = document.getElementById("doing-text");
 const appIconEl = document.getElementById("app-icon");
+const typewriterText = document.getElementById("typewriter-text");
+const typewriterCursor = document.getElementById("typewriter-cursor");
 const responseTextEl = document.getElementById("response-text");
 const responseCursorEl = document.getElementById("response-cursor");
 const responseDismissEl = document.getElementById("response-dismiss");
@@ -133,39 +137,61 @@ function setIslandState(nextStateClass) {
   wrapper.className = `glass-pill ${nextStateClass}`;
 }
 
-function setState(next, { tier = "", text = null, appName = "", iconUrl = "", force = false } = {}) {
+function switchContent(target) {
+  uiIdle.classList.remove('active');
+  uiListening.classList.remove('active');
+  uiLoading.classList.remove('active');
+  uiDoing.classList.remove('active');
+  target.classList.add('active');
+}
+
+/** Truncate text to a maximum number of words */
+function truncateToWords(text, max = 2) {
+  const words = (text || '').trim().split(/\s+/);
+  if (words.length <= max) return text.trim();
+  return words.slice(0, max).join(' ') + '…';
+}
+
+function setState(next, { tier = "", text = null, appName = "", iconUrl = "", force = false, variant = "" } = {}) {
   if (!force && app.current === next) return;
   app.current = next;
 
-  uiSpeech.classList.add('hidden');
-  uiLoading.classList.add('hidden');
-  uiDoing.classList.add('hidden');
+  // Clear any previous variant class
+  wrapper.classList.remove('variant-browsing', 'variant-typing', 'variant-searching', 'variant-executing', 'variant-planning');
 
   // Hide response card when switching to non-response states
-  // (skip if already animating out via 'dismissing' class)
   if (next !== State.RESPONDING && !uiResponse.classList.contains('dismissing')) {
     dismissResponseCard(true);
   }
 
   if (next === State.IDLE) {
+    glow.classList.remove('active');
     setIslandState('state-idle');
-    uiSpeech.classList.remove('hidden');
+    switchContent(uiIdle);
     statusEl.innerText = "Hey Moonwalk";
+    typewriterText.innerText = '';
   }
   else if (next === State.LISTENING) {
+    glow.classList.add('active');
     setIslandState('state-listening');
-    uiSpeech.classList.remove('hidden');
-    statusEl.innerText = "Listening...";
+    switchContent(uiListening);
+    typewriterText.innerText = "Listening...";
+    typewriterCursor.style.display = 'inline-block';
   }
   else if (next === State.LOADING) {
+    glow.classList.add('active');
     setIslandState('state-loading');
-    uiLoading.classList.remove('hidden');
+    switchContent(uiLoading);
   }
   else if (next === State.DOING) {
+    glow.classList.add('active');
     setIslandState('state-doing');
-    uiDoing.classList.remove('hidden');
+    switchContent(uiDoing);
 
-    if (text) doingTextEl.innerText = text;
+    // Apply variant class for visual differentiation
+    if (variant) wrapper.classList.add(`variant-${variant}`);
+
+    if (text) doingTextEl.innerText = truncateToWords(text, 2);
 
     if (iconUrl) {
       appIconEl.src = iconUrl;
@@ -175,8 +201,9 @@ function setState(next, { tier = "", text = null, appName = "", iconUrl = "", fo
     }
   }
   else if (next === State.RESPONDING) {
+    glow.classList.add('active');
     setIslandState('state-loading');
-    uiLoading.classList.remove('hidden');
+    switchContent(uiLoading);
   }
 }
 
@@ -379,9 +406,8 @@ function showResponseCard(fullText, awaitInput = false) {
 
       if (awaitInput || app.conversationMode) {
         setIslandState('state-listening');
-        uiLoading.classList.add('hidden');
-        uiSpeech.classList.remove('hidden');
-        statusEl.innerText = app.conversationMode ? "Listening..." : "Listening...";
+        switchContent(uiListening);
+        typewriterText.innerText = "Listening...";
         app.current = State.LISTENING;
         app.autoResetTimer = setTimeout(() => {
           dismissResponseCard();
@@ -391,8 +417,7 @@ function showResponseCard(fullText, awaitInput = false) {
         }, app.conversationMode ? 120000 : 30000);
       } else {
         setIslandState('state-idle');
-        uiLoading.classList.add('hidden');
-        uiSpeech.classList.remove('hidden');
+        switchContent(uiIdle);
         statusEl.innerText = "Hey Moonwalk";
         app.autoResetTimer = setTimeout(() => {
           dismissResponseCard();
@@ -973,15 +998,13 @@ function showProductsModal(data, awaitInput) {
 function afterModalShow(awaitInput, defaultTimeout, persistent = false) {
   if (awaitInput || app.conversationMode) {
     setIslandState('state-listening');
-    uiLoading.classList.add('hidden');
-    uiSpeech.classList.remove('hidden');
-    statusEl.innerText = "Listening...";
+    switchContent(uiListening);
+    typewriterText.innerText = "Listening...";
     app.current = State.LISTENING;
     if (!persistent) scheduleModalAutoDismiss(true, app.conversationMode ? 120000 : 30000);
   } else {
     setIslandState('state-idle');
-    uiLoading.classList.add('hidden');
-    uiSpeech.classList.remove('hidden');
+    switchContent(uiIdle);
     statusEl.innerText = "Hey Moonwalk";
     if (!persistent) scheduleModalAutoDismiss(false, defaultTimeout);
   }
@@ -1162,6 +1185,7 @@ function connectWebSocket() {
           text: msg.text || "Working...",
           appName: msg.app || "",
           iconUrl: msg.icon_url || "",
+          variant: msg.variant || "",
           force: true
         });
         return;

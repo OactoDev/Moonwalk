@@ -11,20 +11,31 @@
 
 <body>
   <div class="stage">
+
+    <div id="glow" class="ambient-glow"></div>
+
     <div class="glass-pill state-idle" id="ui-wrapper">
 
-      <!-- Speech (Idle / Listening) -->
-      <div class="content-wrapper" id="ui-speech">
+      <!-- Idle -->
+      <div class="content-wrapper active" id="ui-idle">
         <svg class="mic-icon" viewBox="0 0 24 24">
           <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
-          <path
-            d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
+          <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
         </svg>
         <span class="status-text" id="status-text">Hey Moonwalk</span>
       </div>
 
+      <!-- Listening (with typewriter) -->
+      <div class="content-wrapper" id="ui-listening">
+        <svg class="mic-icon" style="fill: #86868b;" viewBox="0 0 24 24">
+          <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
+          <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
+        </svg>
+        <span class="status-text" id="typewriter-text"></span><span class="cursor" id="typewriter-cursor"></span>
+      </div>
+
       <!-- Loading (Thinking) -->
-      <div class="content-wrapper hidden" id="ui-loading">
+      <div class="content-wrapper" id="ui-loading" style="width: 100%; justify-content: center; transform: none; left: 0;">
         <div class="bouncing-balls">
           <div class="ball"></div>
           <div class="ball"></div>
@@ -33,7 +44,7 @@
       </div>
 
       <!-- Doing (Action in progress) -->
-      <div class="content-wrapper hidden" id="ui-doing">
+      <div class="content-wrapper" id="ui-doing">
         <div class="spinner"></div>
         <img src="" alt="App Icon" class="app-icon" id="app-icon" />
         <span class="status-text" id="doing-text">Processing...</span>
@@ -152,23 +163,16 @@
     </div>
 
     <!-- ═══ Command Panel (shortcut-driven text prompting) ═══ -->
+    <!-- ═══ Command Panel (shortcut-driven text prompting) ═══ -->
     <div class="command-panel hidden" id="command-panel">
-      <div class="command-panel-header">
-        <div class="command-panel-title">Moonwalk Agent</div>
-        <button class="command-panel-close" id="command-panel-close" aria-label="Close">Close</button>
-      </div>
-      <div class="command-panel-subtitle">Type a request and run it directly.</div>
-      <div class="command-panel-capabilities">
-        Browser tasks, file edits, shell commands, app actions, Google Workspace, and multi-step agent execution.
-      </div>
       <textarea
         id="command-input"
         class="command-input"
-        placeholder="Example: research UK housing systems and create a Google document with findings"></textarea>
-      <div class="command-panel-footer">
-        <span class="command-panel-hint">Enter to send. Shift+Enter for newline.</span>
-        <button class="command-panel-send" id="command-panel-send">Run</button>
-      </div>
+        placeholder="Type a request..."
+        rows="1"></textarea>
+      <button class="command-panel-send" id="command-panel-send" aria-label="Run command">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+      </button>
     </div>
   </div>
 

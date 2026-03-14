@@ -385,6 +385,78 @@ class TaskPlanner(LegacyTaskPlannerCompatMixin):
             source="milestone_media_shortcut",
         )
 
+    def _build_simple_intent_shortcut(
+        self,
+        user_request: str,
+        intent: UserIntent,
+        world_state: WorldState,
+        available_tools: Optional[List[str]] = None,
+    ) -> Optional[MilestonePlan]:
+        """
+        Fast-path shortcut for simple, unambiguous intents that map 1:1 to a single tool call.
+        Bypasses the LLM planning phase (saving 2-4 seconds) for commands like "open Spotify",
+        "lock screen", or "set volume to 50%".
+        """
+        if intent.ambiguous or intent.confidence < 0.8:
+            return None
+
+        allowed = set(available_tools or [])
+        summary = ""
+        goal = ""
+        signal = ""
+        hint_tool = ""
+        target = intent.target_value
+
+        # 1) Open Application
+        if intent.action == IntentAction.OPEN and intent.target_type == TargetType.APP and target:
+            if "open_app" not in allowed: return None
+            summary = f"Open {target}"
+            goal = f"Open the {target} application"
+            signal = f"The {target} application is running and active"
+            hint_tool = "open_app"
+
+        # 2) Open URL
+        elif intent.action == IntentAction.OPEN and intent.target_type == TargetType.URL and target:
+            if "open_url" not in allowed: return None
+            summary = f"Open {target}"
+            goal = f"Open {target} in the browser"
+            signal = "The requested URL is open"
+            hint_tool = "open_url"
+
+        # 3) System Control: Volume
+        elif intent.action == IntentAction.SET and intent.target_type == TargetType.SYSTEM_STATE and "volume" in (target or "").lower():
+            if "system_control" not in allowed: return None
+            summary = "Adjust system volume"
+            goal = f"Set system volume to requested level ({target})"
+            signal = "System volume is updated"
+            hint_tool = "system_control"
+
+        # 4) System Control: Lock / Sleep
+        elif intent.action == IntentAction.SYSTEM_COMMAND and target and target.lower() in ("lock", "sleep"):
+            if "system_control" not in allowed: return None
+            summary = f"{target.title()} the system"
+            goal = f"Execute the {target} command"
+            signal = "System command executed"
+            hint_tool = "system_control"
+
+        if not hint_tool:
+            return None
+
+        return MilestonePlan(
+            task_summary=summary,
+            milestones=[
+                Milestone(
+                    id=1,
+                    goal=goal,
+                    success_signal=signal,
+                    hint_tools=[hint_tool],
+                    deliverable_key="action_complete",
+                )
+            ],
+            final_response="Done.",
+            source="milestone_simple_intent_shortcut",
+        )
+
     def _looks_like_repeat_message_request(
         self,
         user_request: str,
@@ -477,6 +549,11 @@ class TaskPlanner(LegacyTaskPlannerCompatMixin):
         if media_shortcut is not None:
             print(f"[Planner] Direct media shortcut ({time.time() - t_start:.2f}s)")
             return media_shortcut
+
+        simple_intent_shortcut = self._build_simple_intent_shortcut(user_request, intent, world_state, available_tools)
+        if simple_intent_shortcut is not None:
+            print(f"[Planner] Simple intent shortcut ({time.time() - t_start:.2f}s)")
+            return simple_intent_shortcut
 
         skill_candidates = self.template_registry.get_skill_candidates(
             user_request=user_request,

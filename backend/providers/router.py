@@ -86,12 +86,24 @@ _TRIVIAL_APP_OPEN_RE = re.compile(
     r"^\s*(?:open|launch|start|show)\s+(?:the\s+)?([a-z0-9][a-z0-9 .+-]{0,40})\s*$",
     re.IGNORECASE,
 )
+_TRIVIAL_APP_QUIT_RE = re.compile(
+    r"^\s*(?:quit|close|exit|kill|hide|minimise|minimize)\s+(?:the\s+)?([a-z0-9][a-z0-9 .+-]{0,40})\s*$",
+    re.IGNORECASE,
+)
 _TRIVIAL_SYSTEM_RE = re.compile(
     r"^\s*(?:set\s+)?(?:the\s+)?(?:volume|brightness)(?:\s+(?:to|at))?\s+\d{1,3}\s*$",
     re.IGNORECASE,
 )
+_TRIVIAL_SYSTEM_CONTROL_RE = re.compile(
+    r"^\s*(?:mute|unmute|sleep|lock\s+screen|lock\s+(?:the\s+)?screen|volume\s+(?:up|down)|brightness\s+(?:up|down)|turn\s+(?:up|down)\s+(?:the\s+)?(?:volume|brightness))\s*$",
+    re.IGNORECASE,
+)
 _TRIVIAL_MEDIA_RE = re.compile(
-    r"^\s*(?:play|pause|resume|skip|next|previous)\s*(?:song|music|track|media)?\s*$",
+    r"^\s*(?:play|pause|resume|skip|next|previous|mute)\s*(?:song|music|track|media)?\s*$",
+    re.IGNORECASE,
+)
+_TRIVIAL_TAB_RE = re.compile(
+    r"^\s*(?:new\s+tab|close\s+(?:this\s+)?tab|reopen\s+(?:last\s+)?tab|go\s+back|go\s+forward)\s*$",
     re.IGNORECASE,
 )
 _TRIVIAL_QUERY_RE = re.compile(
@@ -266,9 +278,15 @@ class ModelRouter:
 
         if _TRIVIAL_APP_OPEN_RE.match(normalized):
             return True
+        if _TRIVIAL_APP_QUIT_RE.match(normalized):
+            return True
         if _TRIVIAL_SYSTEM_RE.match(normalized):
             return True
+        if _TRIVIAL_SYSTEM_CONTROL_RE.match(normalized):
+            return True
         if _TRIVIAL_MEDIA_RE.match(normalized):
+            return True
+        if _TRIVIAL_TAB_RE.match(normalized):
             return True
         if _TRIVIAL_QUERY_RE.match(normalized):
             return True

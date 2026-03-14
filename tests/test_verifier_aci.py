@@ -27,6 +27,24 @@ def _verify(tool_name: str, tool_result: str, tool_args: Optional[dict] = None):
     return asyncio.run(run())
 
 
+def _verify_with_visual(tool_name: str, tool_result: str, tool_args: Optional[dict] = None, visual_summary: str = ""):
+    verifier = ToolVerifier()
+
+    async def _visual():
+        return visual_summary
+
+    async def run():
+        return await verifier.verify_with_visual(
+            tool_name=tool_name,
+            tool_args=tool_args or {},
+            tool_result=tool_result,
+            success_criteria="",
+            get_visual_state=_visual,
+        )
+
+    return asyncio.run(run())
+
+
 def test_verify_read_page_content_empty_fails():
     result = json.dumps(
         {
@@ -149,3 +167,60 @@ def test_verify_get_ui_tree_timeout_fails():
         {"app_name": "WhatsApp"},
     )
     assert verification.success is False
+
+
+def test_verify_gdocs_create_partial_success_requests_same_doc_repair():
+    verification = _verify(
+        "gdocs_create",
+        json.dumps(
+            {
+                "ok": False,
+                "url": "https://docs.google.com/document/d/abc123/edit",
+                "note": "Google Doc opened, but title or body was not applied reliably.",
+                "error_code": "gdocs_apply_failed",
+                "title_applied": True,
+                "body_applied": False,
+                "repairable": True,
+            }
+        ),
+        {"title": "Egham Apartment Research"},
+    )
+    assert verification.success is False
+    assert verification.should_retry is True
+    assert "same Google Doc" in (verification.suggested_fix or "")
+
+
+def test_verify_with_visual_keeps_successful_gdocs_create_without_visual_override():
+    verification = _verify_with_visual(
+        "gdocs_create",
+        json.dumps(
+            {
+                "ok": True,
+                "url": "https://docs.google.com/document/d/abc123/edit",
+                "doc_id": "abc123",
+                "note": "Opened a new Google Doc and applied the requested title/content.",
+            }
+        ),
+        {"title": "Fascinating Facts About Octopuses"},
+        visual_summary="App: Electron\nTitle: Moonwalk\nProceed button visible",
+    )
+    assert verification.success is True
+    assert "Google Doc created" in verification.message
+
+
+def test_verify_gdocs_append_success_requires_real_append_signal():
+    verification = _verify(
+        "gdocs_append",
+        json.dumps(
+            {
+                "ok": True,
+                "doc_id": "abc123",
+                "url": "https://docs.google.com/document/d/abc123/edit",
+                "appended_chars": 3176,
+                "method": "keyboard_paste_html",
+            }
+        ),
+        {"doc_url_or_id": "abc123", "text": "Pizza history"},
+    )
+    assert verification.success is True
+    assert "Google Doc updated" in verification.message

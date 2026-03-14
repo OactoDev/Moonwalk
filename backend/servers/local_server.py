@@ -74,8 +74,9 @@ class VoiceAssistant:
         # We try to initialize Porcupine, but it will fail if the key is default
         try:
             if PICOVOICE_ACCESS_KEY != "YOUR_PICOVOICE_ACCESS_KEY_HERE":
-                base_dir = os.path.dirname(os.path.abspath(__file__))
-                custom_ppn = os.path.join(base_dir, "hey_moonwalk.ppn")
+                # Look for the .ppn file in the project root (one level above _backend_dir)
+                project_root = os.path.abspath(os.path.join(_backend_dir, ".."))
+                custom_ppn = os.path.join(project_root, "hey_moonwalk.ppn")
                 
                 if os.path.exists(custom_ppn):
                     self.porcupine = pvporcupine.create(

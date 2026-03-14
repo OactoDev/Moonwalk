@@ -1,7 +1,7 @@
 :root {
-  --text: #333;
+  --text: #1d1d1f;
   --text-active: #007aff;
-  --muted: #888;
+  --muted: #6e6e73;
   --accent: #007aff;
   --dark-glass: rgba(20, 20, 22, 0.92);
   --dark-border: rgba(255, 255, 255, 0.08);
@@ -28,13 +28,16 @@ body {
 }
 
 .stage {
+  position: relative;
   width: 100vw;
   height: 100vh;
   display: flex;
   flex-direction: column;
   justify-content: flex-start;
   align-items: center;
-  padding-top: 20px;
+  padding-top: 40px;
+  padding-bottom: 80px;
+  gap: 16px;
   pointer-events: none;
 }
 
@@ -43,37 +46,37 @@ body {
    ══════════════════════════════════════════ */
 .glass-pill {
   position: relative;
-  height: 60px;
-  border-radius: 40px;
+  height: 64px;
+  border-radius: 32px;
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 12px;
+  justify-content: flex-start;
   padding: 0 24px;
   box-sizing: border-box;
   overflow: hidden;
   pointer-events: auto;
+  z-index: 10;
 
-  background: rgba(255, 255, 255, 0.85);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  background: rgba(255, 255, 255, 0.75);
+  backdrop-filter: blur(30px) saturate(200%);
+  -webkit-backdrop-filter: blur(30px) saturate(200%);
 
   box-shadow:
-    0 15px 35px rgba(0, 0, 0, 0.2),
-    inset 4px 4px 8px rgba(255, 255, 255, 1),
-    inset -4px -4px 8px rgba(0, 0, 0, 0.08);
+    0 12px 32px -8px rgba(0, 0, 0, 0.1),
+    inset 0 1px 1px rgba(255, 255, 255, 0.9),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.05);
+  border: 1px solid rgba(0, 0, 0, 0.04);
 
-  border: 1px solid rgba(255, 255, 255, 0.8);
-  transition: all 0.6s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+  transition: width 0.6s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 /* ── Conversation Mode indicator ── */
 .glass-pill.conversation-mode {
   border: 1.5px solid rgba(52, 199, 89, 0.5);
   box-shadow:
-    0 15px 35px rgba(0, 0, 0, 0.2),
-    inset 4px 4px 8px rgba(255, 255, 255, 1),
-    inset -4px -4px 8px rgba(0, 0, 0, 0.08),
+    0 12px 32px -8px rgba(0, 0, 0, 0.1),
+    inset 0 1px 1px rgba(255, 255, 255, 0.9),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.05),
     0 0 12px rgba(52, 199, 89, 0.15);
 }
 
@@ -101,23 +104,18 @@ body {
   }
 }
 
-/* ── State Sizing & Glows ── */
+/* ── State Sizing ── */
 .state-idle {
-  width: 200px;
+  width: 220px;
 }
 
 .state-listening {
-  width: 380px;
-  height: 70px;
-  box-shadow:
-    0 15px 35px rgba(0, 0, 0, 0.2),
-    inset 4px 4px 8px rgba(255, 255, 255, 1),
-    inset -4px -4px 8px rgba(0, 0, 0, 0.08),
-    inset 0 0 25px rgba(0, 122, 255, 0.3);
+  width: 440px;
 }
 
 .state-loading {
-  width: 120px;
+  width: 140px;
+  justify-content: center;
 }
 
 .state-doing {
@@ -126,45 +124,93 @@ body {
 
 /* ── Typography ── */
 .status-text {
-  color: #333;
+  color: #1d1d1f;
   font-weight: 500;
-  font-size: 16px;
+  font-size: 18px;
+  letter-spacing: -0.01em;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 240px;
+  max-width: 340px;
   transition: color 0.3s ease;
-  text-transform: capitalize;
 }
 
 .state-listening .status-text {
   color: #007aff;
 }
 
-/* ── Content Wrappers ── */
+/* ── Content Wrappers (absolute positioned, opacity-switched) ── */
 .content-wrapper {
+  position: absolute;
   display: flex;
   align-items: center;
-  gap: 12px;
-  overflow: hidden;
-  max-width: 100%;
-  animation: fade-in 0.4s ease;
+  gap: 14px;
+  opacity: 0;
+  transform: translateX(-10px);
+  transition: opacity 0.3s ease, transform 0.4s ease;
+  pointer-events: none;
+}
+
+.content-wrapper.active {
+  opacity: 1;
+  transform: translateX(0);
+  pointer-events: auto;
+  transition-delay: 0.2s;
 }
 
 .hidden {
   display: none !important;
 }
 
-@keyframes fade-in {
-  from {
-    opacity: 0;
-    transform: scale(0.95);
+/* Typing cursor */
+.cursor {
+  display: inline-block;
+  width: 2px;
+  height: 20px;
+  background: #007aff;
+  margin-left: 2px;
+  animation: blink 0.9s infinite;
+}
+
+@keyframes blink {
+
+  0%,
+  100% {
+    opacity: 1;
   }
 
-  to {
-    opacity: 1;
-    transform: scale(1);
+  50% {
+    opacity: 0;
   }
+}
+
+/* ══════════════════════════════════════════
+   THE GLOW
+   ══════════════════════════════════════════ */
+.ambient-glow {
+  position: absolute;
+  top: 80px;
+  width: 480px;
+  height: 280px;
+
+  background:
+    radial-gradient(circle at 10% 10%, rgba(255, 150, 100, 0.45) 0%, transparent 60%),
+    radial-gradient(circle at 90% 10%, rgba(100, 200, 255, 0.45) 0%, transparent 60%),
+    radial-gradient(circle at 50% 90%, rgba(200, 100, 255, 0.35) 0%, transparent 60%),
+    radial-gradient(circle at 50% 50%, rgba(100, 255, 180, 0.3) 0%, transparent 60%);
+
+  filter: blur(40px);
+  z-index: 1;
+  pointer-events: none;
+
+  opacity: 0;
+  transform: scale(0.5);
+  transition: opacity 0.8s ease, transform 0.8s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.ambient-glow.active {
+  opacity: 1;
+  transform: scale(1.1);
 }
 
 /* ── Bouncing Balls (Loading / Thinking) ── */
@@ -176,8 +222,8 @@ body {
 }
 
 .ball {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
   background-color: #007aff;
   border-radius: 50%;
   animation: bounce 0.5s infinite alternate;
@@ -223,6 +269,52 @@ body {
   }
 }
 
+/* ── Status Variants (colored spinner + subtle pill tint) ── */
+.variant-browsing .spinner {
+  border-color: rgba(175, 82, 222, 0.2);
+  border-top-color: #af52de;
+}
+
+.variant-typing .spinner {
+  border-color: rgba(52, 199, 89, 0.2);
+  border-top-color: #34c759;
+}
+
+.variant-searching .spinner {
+  border-color: rgba(255, 149, 0, 0.2);
+  border-top-color: #ff9500;
+}
+
+.variant-executing .spinner {
+  border-color: rgba(255, 59, 48, 0.2);
+  border-top-color: #ff3b30;
+}
+
+.variant-planning .spinner {
+  border-color: rgba(90, 200, 250, 0.2);
+  border-top-color: #5ac8fa;
+}
+
+.variant-browsing .status-text {
+  color: #af52de;
+}
+
+.variant-typing .status-text {
+  color: #34c759;
+}
+
+.variant-searching .status-text {
+  color: #ff9500;
+}
+
+.variant-executing .status-text {
+  color: #ff3b30;
+}
+
+.variant-planning .status-text {
+  color: #5ac8fa;
+}
+
 /* ── Dynamic App Icon ── */
 .app-icon {
   width: 28px;
@@ -235,134 +327,94 @@ body {
 
 /* ── SVG Mic Icon ── */
 .mic-icon {
-  width: 20px;
-  height: 20px;
-  fill: #888;
+  width: 22px;
+  height: 22px;
+  fill: #6e6e73;
+  transition: fill 0.3s ease;
 }
 
-.state-listening .mic-icon {
-  fill: #007aff;
-  animation: pulse 1.5s infinite;
-}
-
-@keyframes pulse {
-  0% {
-    transform: scale(1);
-    opacity: 1;
-  }
-
-  50% {
-    transform: scale(1.2);
-    opacity: 0.7;
-  }
-
-  100% {
-    transform: scale(1);
-    opacity: 1;
-  }
+.state-listening .status-text {
+  color: #007aff;
 }
 
 /* ══════════════════════════════════════════
    Command Panel (Shortcut Prompting)
    ══════════════════════════════════════════ */
 .command-panel {
-  width: min(760px, calc(100vw - 80px));
-  margin-top: 14px;
-  padding: 16px;
-  border-radius: 14px;
+  width: 640px;
+  min-height: 56px;
+  margin-top: 24px;
+  border-radius: 28px;
+  padding: 6px 6px 6px 20px;
   pointer-events: auto;
   display: flex;
-  flex-direction: column;
-  gap: 10px;
-  background: rgba(255, 255, 255, 0.94);
-  border: 1px solid rgba(20, 26, 32, 0.1);
-  box-shadow: 0 14px 30px rgba(17, 24, 39, 0.16);
-  animation: modal-appear 0.24s ease;
-}
-
-.command-panel-header {
-  display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  gap: 12px;
+
+  background: rgba(255, 255, 255, 0.75);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+
+  box-shadow:
+    0 16px 32px -8px rgba(0, 0, 0, 0.1),
+    0 4px 12px -4px rgba(0, 0, 0, 0.05),
+    inset 0 1px 1px rgba(255, 255, 255, 0.9),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.02);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+
+  animation: modal-appear 0.3s cubic-bezier(0.25, 1, 0.5, 1);
+  transition: box-shadow 0.25s ease, border-color 0.25s ease;
 }
 
-.command-panel-title {
-  font-size: 14px;
-  font-weight: 700;
-  color: #0f172a;
-}
-
-.command-panel-close {
-  border: 1px solid rgba(15, 23, 42, 0.18);
-  background: #fff;
-  color: #0f172a;
-  border-radius: 8px;
-  font-size: 12px;
-  font-weight: 600;
-  padding: 6px 10px;
-  cursor: pointer;
-}
-
-.command-panel-close:hover {
-  background: #f5f7fa;
-}
-
-.command-panel-subtitle {
-  font-size: 12px;
-  color: #334155;
-}
-
-.command-panel-capabilities {
-  font-size: 12px;
-  color: #475569;
-  line-height: 1.35;
+.command-panel:focus-within {
+  border-color: rgba(0, 122, 255, 0.3);
+  box-shadow:
+    0 16px 32px -8px rgba(0, 122, 255, 0.15),
+    0 4px 12px -4px rgba(0, 0, 0, 0.05),
+    0 0 0 3px rgba(0, 122, 255, 0.15);
 }
 
 .command-input {
-  width: 100%;
-  min-height: 86px;
-  resize: vertical;
-  border-radius: 10px;
-  border: 1px solid rgba(15, 23, 42, 0.18);
-  background: #ffffff;
-  color: #0f172a;
-  font-size: 13px;
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: #1d1d1f;
+  font-size: 15px;
   line-height: 1.4;
-  padding: 10px 12px;
+  padding: 8px 0;
   outline: none;
+  resize: none;
+  font-family: inherit;
 }
 
-.command-input:focus {
-  border-color: rgba(0, 122, 255, 0.55);
-  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.12);
-}
-
-.command-panel-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-
-.command-panel-hint {
-  font-size: 11px;
-  color: #64748b;
+.command-input::placeholder {
+  color: #86868b;
 }
 
 .command-panel-send {
+  flex-shrink: 0;
+  width: 44px;
+  height: 44px;
+  border-radius: 22px;
   border: none;
-  border-radius: 8px;
-  padding: 7px 12px;
-  background: #0f172a;
+  background: #007aff;
   color: #ffffff;
-  font-size: 12px;
-  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.25, 1, 0.5, 1);
+  box-shadow: 0 4px 12px -2px rgba(0, 122, 255, 0.4);
 }
 
 .command-panel-send:hover {
-  background: #1e293b;
+  background: #0066d6;
+  transform: scale(1.05);
+  box-shadow: 0 6px 16px -2px rgba(0, 122, 255, 0.5);
+}
+
+.command-panel-send:active {
+  transform: scale(0.96);
 }
 
 /* ══════════════════════════════════════════
@@ -370,25 +422,24 @@ body {
    ══════════════════════════════════════════ */
 .response-card {
   position: relative;
-  width: 420px;
+  width: 440px;
   max-height: 260px;
-  margin-top: 10px;
-  border-radius: 22px;
-  padding: 16px 20px;
+  border-radius: 18px;
+  padding: 20px 24px;
   pointer-events: auto;
   overflow-y: auto;
+  z-index: 10;
 
-  /* ── Exact same surface as the pill ── */
-  background: rgba(255, 255, 255, 0.85);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(30px) saturate(200%);
+  -webkit-backdrop-filter: blur(30px) saturate(200%);
 
   box-shadow:
-    0 15px 35px rgba(0, 0, 0, 0.2),
-    inset 4px 4px 8px rgba(255, 255, 255, 1),
-    inset -4px -4px 8px rgba(0, 0, 0, 0.08);
+    0 8px 24px -6px rgba(0, 0, 0, 0.08),
+    inset 0 1px 1px rgba(255, 255, 255, 0.9),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.05);
 
-  border: 1px solid rgba(255, 255, 255, 0.8);
+  border: 1px solid rgba(0, 0, 0, 0.04);
   animation: modal-appear 0.38s cubic-bezier(0.32, 0.72, 0, 1);
   transform-origin: top center;
 }
@@ -622,38 +673,37 @@ body {
 .modal-confirm,
 .modal-media,
 .modal-steps,
-.modal-products {
+.modal-products,
+.response-card {
   position: relative;
-  margin-top: 12px;
-  border-radius: 24px; /* Slightly rounder to match native iOS */
-  padding: 24px; /* Breathes a bit more */
+  width: 460px;
+  border-radius: 24px;
+  padding: 24px;
   pointer-events: auto;
+  z-index: 10;
 
-  /* Cleaner Glassmorphism */
-  background: rgba(255, 255, 255, 0.75); /* Slightly more transparent to let blur do the work */
+  background: rgba(255, 255, 255, 0.75);
   backdrop-filter: blur(24px) saturate(180%);
   -webkit-backdrop-filter: blur(24px) saturate(180%);
 
-  /* Layered, softer drop shadows + crisp inner border highlight */
-  box-shadow: 
+  box-shadow:
     0 20px 40px -8px rgba(0, 0, 0, 0.12),
     0 8px 16px -4px rgba(0, 0, 0, 0.06),
     inset 0 1px 1px rgba(255, 255, 255, 0.9),
     inset 0 -1px 1px rgba(0, 0, 0, 0.02);
-  
-  /* Subtler outer border */
+
   border: 1px solid rgba(0, 0, 0, 0.08);
-  
-  /* Smoother Apple-like spring animation */
-  animation: modal-appear 0.4s cubic-bezier(0.25, 1, 0.5, 1);
+
+  animation: modal-appear 0.5s cubic-bezier(0.25, 1, 0.5, 1) backwards;
   transform-origin: top center;
 }
 
 @keyframes modal-appear {
   from {
     opacity: 0;
-    transform: translateY(-8px) scale(0.96);
+    transform: translateY(-16px) scale(0.96);
   }
+
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
@@ -732,7 +782,8 @@ body {
 .modal-list-title,
 .modal-steps-title,
 .modal-products-title {
-  font-size: 17px; /* Native iOS modal title size */
+  font-size: 17px;
+  /* Native iOS modal title size */
   font-weight: 600;
   color: #1d1d1f;
   margin-bottom: 8px;
@@ -745,7 +796,8 @@ body {
 .modal-products-message,
 .modal-media-message {
   font-size: 14px;
-  color: #6e6e73; /* Native secondary text color */
+  color: #6e6e73;
+  /* Native secondary text color */
   line-height: 1.5;
   margin-bottom: 16px;
 }
@@ -908,7 +960,8 @@ body {
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.4);
   border: 1px solid rgba(0, 0, 0, 0.06);
-  overflow: hidden; /* Ensures rounded corners clip the rows */
+  overflow: hidden;
+  /* Ensures rounded corners clip the rows */
   flex: 1;
 }
 
@@ -920,7 +973,8 @@ body {
 }
 
 .modal-table-el thead th {
-  background: rgba(245, 245, 247, 0.8); /* Standard Apple table header */
+  background: rgba(245, 245, 247, 0.8);
+  /* Standard Apple table header */
   font-size: 12px;
   color: #6e6e73;
   padding: 10px 16px;
@@ -941,7 +995,8 @@ body {
   font-size: 14px;
   color: #1d1d1f;
   border-bottom: 1px solid rgba(0, 0, 0, 0.04);
-  font-variant-numeric: tabular-nums; /* Keeps numbers aligned neatly */
+  font-variant-numeric: tabular-nums;
+  /* Keeps numbers aligned neatly */
   line-height: 1.45;
 }
 
@@ -1003,7 +1058,8 @@ body {
   gap: 12px;
   padding: 12px 14px;
   border-radius: 16px;
-  background: rgba(255, 255, 255, 0.4); /* Gives items their own distinct surface */
+  background: rgba(255, 255, 255, 0.4);
+  /* Gives items their own distinct surface */
   border: 1px solid rgba(0, 0, 0, 0.04);
   transition: all 0.25s cubic-bezier(0.25, 0.8, 0.25, 1);
   cursor: pointer;
@@ -1058,7 +1114,8 @@ body {
 
 .list-card-desc {
   font-size: 13px;
-  color: #86868b; /* Better contrast than 0.45 opacity */
+  color: #86868b;
+  /* Better contrast than 0.45 opacity */
   line-height: 1.4;
 }
 
@@ -1135,7 +1192,8 @@ body {
   border: 1px solid rgba(0, 0, 0, 0.04);
   overflow: hidden;
   transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
-  padding: 8px; /* Adds internal padding so the image isn't flush if you don't want it to be */
+  padding: 8px;
+  /* Adds internal padding so the image isn't flush if you don't want it to be */
 }
 
 .card-item.has-link {
@@ -1172,7 +1230,8 @@ body {
 .card-img-wrap {
   width: 90px;
   height: 90px;
-  border-radius: 10px; /* Round the image inside the padded card */
+  border-radius: 10px;
+  /* Round the image inside the padded card */
   flex-shrink: 0;
   overflow: hidden;
   background: #f5f5f7;
@@ -1362,7 +1421,8 @@ body {
 
 .modal-confirm-btn {
   padding: 10px 24px;
-  border-radius: 12px; /* iOS standard button radius */
+  border-radius: 12px;
+  /* iOS standard button radius */
   border: none;
   font-size: 15px;
   font-weight: 500;
@@ -1437,13 +1497,13 @@ body {
 
 /* Plan mode: tighter padding when headerless */
 .modal-steps.mode-plan {
-  padding: 14px 16px 14px;
+  padding: 16px 20px 16px;
 }
 
 /* ── Title ── */
 .modal-steps-title {
-  font-size: 15px;
-  font-weight: 600;
+  font-size: 16px;
+  font-weight: 650;
   color: #1d1d1f;
   letter-spacing: -0.017em;
   line-height: 1.25;
@@ -1453,7 +1513,7 @@ body {
 /* ── Subtitle ── */
 .modal-steps-subtitle {
   font-size: 12px;
-  color: rgba(0, 0, 0, 0.35);
+  color: #6e6e73;
   font-weight: 500;
   letter-spacing: -0.006em;
   margin-top: 3px;
@@ -1464,7 +1524,8 @@ body {
   font-size: 13px;
   color: rgba(0, 0, 0, 0.5);
   line-height: 1.5;
-  margin: 6px 0 4px;
+  margin: 6px 0 12px;
+  /* Increased bottom margin */
   letter-spacing: -0.008em;
 }
 
@@ -1485,29 +1546,34 @@ body {
 .modal-step-item {
   display: flex;
   align-items: flex-start;
-  gap: 11px;
-  padding: 7px 0;
+  gap: 12px;
+  padding: 8px 0;
   position: relative;
-  transition: background 0.15s ease;
-  border-radius: 10px;
-  margin: 0 -6px;
-  padding-left: 6px;
-  padding-right: 6px;
+  transition: background 0.2s ease, transform 0.2s ease;
+  border-radius: 12px;
+  margin: 0 -8px;
+  padding-left: 8px;
+  padding-right: 8px;
 }
 
 .modal-step-item:hover {
-  background: rgba(0, 0, 0, 0.02);
+  background: rgba(0, 122, 255, 0.04);
+  /* Very subtle blue tint on hover */
+  transform: translateX(2px);
+  /* Slight nudge */
 }
 
 /* Vertical connector line (progress mode) */
 .mode-progress .modal-step-item:not(:last-of-type)::after {
   content: '';
   position: absolute;
-  left: 19px;
-  top: 34px;
-  bottom: -3px;
-  width: 1.5px;
-  background: rgba(0, 0, 0, 0.06);
+  left: 21px;
+  top: 36px;
+  bottom: -4px;
+  width: 2px;
+  background: rgba(0, 0, 0, 0.05);
+  /* Softer line */
+  border-radius: 2px;
 }
 
 /* ── Progress indicators ── */
@@ -1523,61 +1589,65 @@ body {
   flex-shrink: 0;
   z-index: 1;
   transition: all 0.3s cubic-bezier(0.32, 0.72, 0, 1);
+  box-shadow: inset 0 1px 2px rgba(255, 255, 255, 0.5);
+  /* Adds depth to the circles */
 }
 
 .modal-step-item.done .step-indicator {
-  background: rgba(52, 199, 89, 0.1);
-  color: #34c759;
-  border: 1.5px solid rgba(52, 199, 89, 0.2);
+  background: #e5f9e7;
+  color: #28a745;
+  border: 1px solid rgba(40, 167, 69, 0.2);
 }
 
 .modal-step-item.current .step-indicator {
-  background: rgba(0, 122, 255, 0.1);
-  color: #007aff;
-  border: 1.5px solid rgba(0, 122, 255, 0.25);
+  background: #007aff;
+  color: #ffffff;
+  border: 2px solid rgba(0, 122, 255, 0.2);
+  box-shadow: 0 4px 12px rgba(0, 122, 255, 0.3), inset 0 1px 2px rgba(255, 255, 255, 0.5);
   animation: step-pulse 2s ease-in-out infinite;
 }
 
 .modal-step-item.pending .step-indicator {
-  background: rgba(0, 0, 0, 0.025);
-  color: rgba(0, 0, 0, 0.25);
-  border: 1.5px solid rgba(0, 0, 0, 0.06);
+  background: rgba(0, 0, 0, 0.03);
+  color: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(0, 0, 0, 0.05);
 }
 
 @keyframes step-pulse {
 
   0%,
   100% {
-    box-shadow: 0 0 0 0 rgba(0, 122, 255, 0.15);
+    box-shadow: 0 4px 12px rgba(0, 122, 255, 0.3), 0 0 0 0 rgba(0, 122, 255, 0.2);
   }
 
   50% {
-    box-shadow: 0 0 0 5px rgba(0, 122, 255, 0);
+    box-shadow: 0 4px 12px rgba(0, 122, 255, 0.3), 0 0 0 6px rgba(0, 122, 255, 0);
   }
 }
 
 /* ══ Plan mode: card-row items ══ */
 .mode-plan .modal-steps-timeline {
-  gap: 5px;
+  gap: 8px;
   padding: 4px 0 4px 0;
 }
 
 .modal-step-item.planned {
-  background: rgba(0, 0, 0, 0.03);
-  border-radius: 12px;
-  padding: 12px 14px;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid rgba(0, 0, 0, 0.04);
+  border-radius: 14px;
+  padding: 14px 16px;
   margin: 0;
-  gap: 12px;
+  gap: 14px;
   align-items: center;
-  cursor: default;
-  transition: background 0.2s ease, transform 0.25s cubic-bezier(0.32, 0.72, 0, 1);
+  cursor: pointer;
+  transition: all 0.25s cubic-bezier(0.32, 0.72, 0, 1);
   animation: plan-item-in 0.35s cubic-bezier(0.32, 0.72, 0, 1) both;
 }
 
 @keyframes plan-item-in {
   from {
     opacity: 0;
-    transform: translateY(6px);
+    transform: translateY(8px);
   }
 
   to {
@@ -1587,7 +1657,9 @@ body {
 }
 
 .modal-step-item.planned:hover {
-  background: rgba(0, 0, 0, 0.045);
+  background: #ffffff;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.06);
+  transform: translateY(-1px);
 }
 
 .modal-step-item.planned:active {
@@ -1596,13 +1668,14 @@ body {
 
 /* Plan step number */
 .step-plan-num {
-  width: 24px;
-  height: 24px;
-  border-radius: 50%;
-  background: rgba(0, 0, 0, 0.06);
-  color: rgba(0, 0, 0, 0.4);
-  font-size: 12px;
-  font-weight: 600;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  /* Squircle instead of perfect circle */
+  background: rgba(0, 122, 255, 0.08);
+  color: #007aff;
+  font-size: 13px;
+  font-weight: 650;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1614,7 +1687,7 @@ body {
 .step-body {
   flex: 1;
   min-width: 0;
-  padding-top: 3px;
+  padding-top: 2px;
 }
 
 .modal-step-item.planned .step-body {
@@ -1622,7 +1695,7 @@ body {
 }
 
 .step-label {
-  font-size: 13.5px;
+  font-size: 14px;
   color: #1d1d1f;
   line-height: 1.35;
   letter-spacing: -0.01em;
@@ -1630,38 +1703,38 @@ body {
 }
 
 .step-detail {
-  font-size: 12px;
-  color: rgba(0, 0, 0, 0.38);
-  line-height: 1.35;
-  margin-top: 1px;
+  font-size: 12.5px;
+  color: #6e6e73;
+  line-height: 1.4;
+  margin-top: 2px;
   letter-spacing: -0.006em;
 }
 
 .modal-step-item.done .step-label {
-  color: rgba(0, 0, 0, 0.5);
+  color: #6e6e73;
 }
 
 .modal-step-item.pending .step-label {
-  color: rgba(0, 0, 0, 0.3);
+  color: rgba(0, 0, 0, 0.4);
 }
 
 .modal-step-item.planned .step-label {
   color: #1d1d1f;
-  font-weight: 500;
-  font-size: 14px;
+  font-weight: 600;
+  font-size: 14.5px;
 }
 
 .modal-step-item.planned .step-detail {
-  color: rgba(0, 0, 0, 0.35);
+  color: #86868b;
 }
 
 /* ── Summary ── */
 .modal-steps-summary {
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px solid rgba(0, 0, 0, 0.04);
-  font-size: 12px;
-  color: rgba(0, 0, 0, 0.4);
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+  font-size: 13px;
+  color: #6e6e73;
   line-height: 1.45;
 }
 
@@ -1671,50 +1744,71 @@ body {
   flex-direction: column;
   align-items: center;
   gap: 0;
-  padding-top: 12px;
-  margin-top: 2px;
+  padding-top: 16px;
+  margin-top: 4px;
 }
 
 .modal-steps-actions.hidden {
   display: none !important;
 }
 
-/* Proceed button — matches pill DNA */
+/* ══════════════════════════════════════════
+   UPGRADED PROCEED BUTTON (AI Style)
+   ══════════════════════════════════════════ */
 .modal-steps-btn-start {
   width: 100%;
-  padding: 11px 24px;
-  border-radius: 980px;
+  padding: 14px 24px;
+  border-radius: 16px;
+  /* Modern squircle radius */
   border: none;
-  background: #1d1d1f;
-  color: #fff;
-  font-size: 14px;
+
+  /* Vibrant AI Gradient */
+  background: linear-gradient(135deg, #007aff 0%, #af52de 100%);
+  color: #ffffff;
+
+  font-size: 15px;
   font-weight: 600;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 7px;
-  letter-spacing: -0.015em;
+  gap: 8px;
+  letter-spacing: -0.01em;
+
+  /* Layered shadow for floating effect and inner glow */
+  box-shadow:
+    0 8px 24px -6px rgba(175, 82, 222, 0.4),
+    inset 0 1px 1px rgba(255, 255, 255, 0.4),
+    inset 0 -2px 4px rgba(0, 0, 0, 0.1);
+
   transition: all 0.3s cubic-bezier(0.32, 0.72, 0, 1);
 }
 
 .modal-steps-btn-start:hover {
-  background: #333;
-  transform: scale(1.02);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+  transform: translateY(-2px);
+  box-shadow:
+    0 12px 32px -6px rgba(175, 82, 222, 0.5),
+    inset 0 1px 1px rgba(255, 255, 255, 0.5),
+    inset 0 -2px 4px rgba(0, 0, 0, 0.1);
+  background: linear-gradient(135deg, #198cff 0%, #ba67e3 100%);
+  /* Slightly brighter on hover */
 }
 
 .modal-steps-btn-start:active {
-  transform: scale(0.975);
-  background: #000;
+  transform: translateY(1px);
+  box-shadow:
+    0 4px 12px -4px rgba(175, 82, 222, 0.3),
+    inset 0 2px 4px rgba(0, 0, 0, 0.15);
 }
 
 .modal-steps-btn-start svg {
-  opacity: 0.7;
-  transition: transform 0.25s ease, opacity 0.25s ease;
+  opacity: 0.9;
+  transition: transform 0.25s cubic-bezier(0.32, 0.72, 0, 1);
+  width: 16px;
+  height: 16px;
 }
 
 .modal-steps-btn-start:hover svg {
-  transform: translateX(2px);
-  opacity: 0.9;
+  transform: translateX(4px);
+  /* Pushes the arrow further on hover */
 }

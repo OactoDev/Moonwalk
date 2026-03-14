@@ -54,6 +54,32 @@ def _make_plan(milestones: list[Milestone], task_summary: str = "Test task") -> 
 
 FAKE_TOOL_DECLS = [
     {
+        "name": "send_response",
+        "description": "Send the final response",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string"},
+                "modal": {"type": "string", "enum": ["text", "cards", "products"]},
+                "cards": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}, "title": {"type": "string"}},
+                    },
+                },
+                "products": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                    },
+                },
+            },
+            "required": ["message"],
+        },
+    },
+    {
         "name": "get_web_information",
         "description": "Read or search web information",
         "parameters": {
@@ -768,6 +794,123 @@ def test_execute_milestone_suspends_on_await_reply():
     )
     assert success is False
     assert result.startswith("AWAIT_REPLY:")
+
+
+def test_execute_milestone_auto_completes_response_only_send_response():
+    responses = [
+        json.dumps({
+            "done": False,
+            "tool": "send_response",
+            "args": {
+                "message": "Here are some example products for you to check out.",
+                "modal": "cards",
+                "cards": [
+                    {"name": "Example Product 1", "price": "$19.99", "description": "Example description."},
+                ],
+            },
+            "reasoning": "Show the requested product modal",
+            "description": "Send the product modal",
+        }),
+        json.dumps({
+            "done": False,
+            "tool": "send_response",
+            "args": {"message": "This second response should never run."},
+            "reasoning": "Should not be called",
+        }),
+    ]
+    llm = FakeLLM(responses)
+    executor = MilestoneExecutor(llm, FAKE_TOOL_DECLS)
+    milestone = Milestone(
+        id=1,
+        goal="Show a product modal to the user",
+        success_signal="A product modal is sent to the user via send_response",
+        hint_tools=["send_response"],
+    )
+
+    calls = []
+
+    async def env_perceiver():
+        return {"active_app": "Finder"}
+
+    async def tool_executor(tool, args):
+        calls.append((tool, dict(args)))
+        return (args["message"], True)
+
+    plan = _make_plan([milestone], task_summary="product modal")
+    success, result = asyncio.run(
+        executor.execute_milestone(
+            milestone=milestone,
+            plan=plan,
+            env_perceiver=env_perceiver,
+            tool_executor=tool_executor,
+            deliverables={},
+            request_scope_tool_names={"send_response"},
+        )
+    )
+
+    assert success is True
+    assert calls == [(
+        "send_response",
+        {
+            "message": "Here are some example products for you to check out.",
+            "modal": "cards",
+            "cards": [{"name": "Example Product 1", "price": "$19.99", "description": "Example description."}],
+        },
+    )]
+    assert result == "Product modal sent to user."
+    assert milestone.actions_taken == 1
+
+
+def test_execute_milestone_does_not_auto_complete_non_response_milestone():
+    responses = [
+        json.dumps({
+            "done": False,
+            "tool": "send_response",
+            "args": {"message": "I found one result so far."},
+            "reasoning": "Share progress",
+            "description": "Send progress update",
+        }),
+        json.dumps({
+            "done": True,
+            "tool": "",
+            "args": {},
+            "reasoning": "Now the result is fully delivered",
+            "deliverable": "Completed the research task",
+        }),
+    ]
+    llm = FakeLLM(responses)
+    executor = MilestoneExecutor(llm, FAKE_TOOL_DECLS)
+    milestone = Milestone(
+        id=1,
+        goal="Research UK housing systems",
+        success_signal="Source notes collected and delivered",
+        hint_tools=["send_response", "get_web_information"],
+    )
+
+    calls = []
+
+    async def env_perceiver():
+        return {"active_app": "Chrome"}
+
+    async def tool_executor(tool, args):
+        calls.append((tool, dict(args)))
+        return (args["message"], True)
+
+    plan = _make_plan([milestone], task_summary="Research UK housing systems")
+    success, result = asyncio.run(
+        executor.execute_milestone(
+            milestone=milestone,
+            plan=plan,
+            env_perceiver=env_perceiver,
+            tool_executor=tool_executor,
+            deliverables={},
+            request_scope_tool_names={"send_response", "get_web_information"},
+        )
+    )
+
+    assert success is True
+    assert calls == [("send_response", {"message": "I found one result so far."})]
+    assert "research task" in result.lower()
 
 
 def test_execute_milestone_blocks_repeated_await_reply_signature():

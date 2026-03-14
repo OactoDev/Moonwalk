@@ -29,7 +29,9 @@ from browser.bridge import browser_bridge
 from browser.models import ActionResult, PageSnapshot, ViewportMeta
 from browser.store import browser_store
 from providers.base import LLMResponse
+from runtime_state import runtime_state_store
 from tools import registry as tool_registry
+from tools.contracts import error_envelope
 from tools.browser_tools import browser_click_ref, browser_describe_ref, browser_refresh_refs
 from tools.file_tools import read_file, write_file
 from tools.mac_tools import await_reply, send_response
@@ -60,6 +62,96 @@ async def test_response_contract_aliases():
     assert payload.startswith("AWAIT:")
     data = json.loads(payload[len("AWAIT:"):])
     assert data["message"] == "what next?"
+
+
+async def test_response_contract_cards_payloads():
+    payload = await send_response(
+        message="Here are some example products for you to check out.",
+        modal="cards",
+        title="Recommended products",
+        subtitle="2 results",
+        cards=[
+            {"name": "Wireless Headphones", "price": "$299.00", "description": "Noise canceling"},
+            {"title": "Fitness Watch", "price": "$199.00", "description": "Sleep and workout tracking"},
+        ],
+    )
+    assert payload.startswith("RESPONSE:")
+    data = json.loads(payload[len("RESPONSE:"):])
+    assert data["modal"] == "cards"
+    assert data["title"] == "Recommended products"
+    assert data["subtitle"] == "2 results"
+    assert len(data["cards"]) == 2
+    assert data["cards"][0]["name"] == "Wireless Headphones"
+    assert data["cards"][1]["title"] == "Fitness Watch"
+
+    legacy = await send_response(
+        message="Legacy products payload",
+        modal="products",
+        products=[{"name": "Legacy Product", "price": "$19.99"}],
+    )
+    legacy_data = json.loads(legacy[len("RESPONSE:"):])
+    assert legacy_data["modal"] == "products"
+    assert legacy_data["cards"][0]["name"] == "Legacy Product"
+    assert legacy_data["products"][0]["name"] == "Legacy Product"
+
+    await_payload = await await_reply(
+        message="Which product do you want?",
+        modal="cards",
+        cards=[{"name": "Option A", "price": "$9.99"}],
+    )
+    await_data = json.loads(await_payload[len("AWAIT:"):])
+    assert await_data["modal"] == "cards"
+    assert await_data["cards"][0]["name"] == "Option A"
+
+
+def test_error_envelope_preserves_legacy_fields():
+    payload = error_envelope(
+        "browser.no_snapshot",
+        "No active browser snapshot is available.",
+        source="tool.browser",
+        details={"session_id": "abc"},
+        flatten_details=True,
+    )
+
+    assert payload["ok"] is False
+    assert payload["error_code"] == "browser.no_snapshot"
+    assert payload["message"] == "No active browser snapshot is available."
+    assert payload["error"]["code"] == "browser.no_snapshot"
+    assert payload["error"]["source"] == "tool.browser"
+    assert payload["session_id"] == "abc"
+
+
+def test_runtime_state_prefers_bridge_browser_truth():
+    browser_store.reset()
+    browser_bridge.reset()
+    runtime_state_store.reset()
+    runtime_state_store.start_request(request_id="req-1", query="test")
+    runtime_state_store.update_os_state(
+        active_app="Google Chrome",
+        browser_url="https://fallback.example.com",
+        provenance="applescript_fallback",
+        degraded=True,
+    )
+
+    browser_bridge.register_connection("bridge-session", "moonwalk-browser-bridge")
+    browser_store.upsert_snapshot(
+        PageSnapshot(
+            session_id="bridge-session",
+            tab_id="tab-1",
+            url="https://bridge.example.com/article",
+            title="Bridge Title",
+            generation=2,
+            viewport=ViewportMeta(width=1280, height=800),
+        )
+    )
+    browser_bridge.register_snapshot(browser_store.get_snapshot("bridge-session"))
+
+    snapshot = runtime_state_store.snapshot()
+    assert snapshot.browser_state.connected is True
+    assert snapshot.browser_state.url == "https://bridge.example.com/article"
+    assert snapshot.os_state.browser_url == "https://bridge.example.com/article"
+    assert snapshot.os_state.browser_url_provenance == "browser_bridge"
+    assert snapshot.os_state.browser_url_degraded is False
 
 
 async def test_file_tools_reliability():
@@ -691,6 +783,9 @@ async def test_get_web_information_query_page_summary_runs_search_follow_read_lo
                     "summary": "The page provides annual analysis of UK housing supply, affordability, and tenure trends.",
                     "headings": [{"text": "Annual housing analysis", "tag": "h2", "ref_id": ""}],
                     "page_type": "report",
+                    "content": "The page provides annual analysis of UK housing supply, affordability, and tenure trends.",
+                    "content_length": 94,
+                    "summary_strategy": "readability",
                     "total_elements": 6,
                     "item_count": 1,
                 }
@@ -712,8 +807,11 @@ async def test_get_web_information_query_page_summary_runs_search_follow_read_lo
         assert payload["ok"] is True
         assert payload["route"] == "browser_aci"
         assert payload["selected_source_url"] == "https://www.cih.org/knowledge-hub/uk-housing-review/"
-        assert payload["search_follow_strategy"] == "flash_choice"
+        assert payload["search_follow_strategy"] == "deterministic-ranking"
         assert payload["summary"].startswith("The page provides annual analysis")
+        assert payload["content"].startswith("The page provides annual analysis")
+        assert payload["content_length"] == 94
+        assert payload["summary_strategy"] == "readability"
         call_names = [name for name, _ in calls]
         assert "web_search" in call_names
         assert "extract_structured_data" in call_names
@@ -790,6 +888,74 @@ async def test_get_web_information_browser_search_scrolls_before_fallback():
     finally:
         selector_module.decide_web_route_with_flash = original_route_decider
         tool_registry.execute = original_execute
+
+
+def test_get_web_information_reuses_selected_source_within_request():
+    async def run():
+        runtime_state_store.reset()
+        runtime_state_store.start_request(query="apartments for rent in Egham UK")
+        runtime_state_store.update_request_state(
+            selected_source_url="https://www.zoopla.co.uk/to-rent/flats/egham/",
+            selected_source_label="Flats and apartments to rent in Egham - Zoopla",
+        )
+        set_tool_gateway_context(active_app="Google Chrome", browser_url="https://www.google.com/search?q=egham+flats", background_mode=False)
+        original_execute = tool_registry.execute
+        original_route_decider = selector_module.decide_web_route_with_flash
+        calls = []
+
+        async def _fake_route_decider(**kwargs):
+            return {
+                "route": "browser_aci",
+                "reason": "Live browser route for active search flow.",
+                "confidence": 0.94,
+                "_interpreter_model": "deterministic-web-policy",
+            }
+
+        async def _tracking_execute(name, args):
+            calls.append((name, dict(args) if isinstance(args, dict) else args))
+            if name == "open_url":
+                return "opened"
+            if name == "browser_refresh_refs":
+                return json.dumps({"ok": True})
+            if name == "extract_structured_data":
+                return json.dumps(
+                    {
+                        "ok": True,
+                        "url": "https://www.zoopla.co.uk/to-rent/flats/egham/",
+                        "title": "Flats and apartments to rent in Egham - Zoopla",
+                        "items": [
+                            {"label": "£1,650 pcm Maxwell Mews, Egham", "href": "https://www.zoopla.co.uk/to-rent/details/70873203/"}
+                        ],
+                        "item_count": 1,
+                        "extraction_strategy": "deterministic-property-cards",
+                        "source_domain": "zoopla.co.uk",
+                    }
+                )
+            if name == "web_search":
+                raise AssertionError("Cached selected source should be reused before starting a new search")
+            return await original_execute(name, args)
+
+        selector_module.decide_web_route_with_flash = _fake_route_decider
+        tool_registry.execute = _tracking_execute
+        try:
+            payload = json.loads(
+                await get_web_information(
+                    query="apartments for rent in Egham UK",
+                    target_type="structured_data",
+                    item_hint="apartment details including price, location, bedrooms, and features",
+                    max_items=5,
+                )
+            )
+            assert payload["ok"] is True
+            assert payload["selected_source_url"] == "https://www.zoopla.co.uk/to-rent/flats/egham/"
+            assert payload["search_follow_strategy"] == "request-state-reuse"
+            assert any(name == "extract_structured_data" for name, _ in calls)
+            assert all(name != "web_search" for name, _ in calls)
+        finally:
+            selector_module.decide_web_route_with_flash = original_route_decider
+            tool_registry.execute = original_execute
+
+    asyncio.run(run())
 
 
 async def test_get_web_information_browser_search_flash_timeout_fails_fast():
@@ -1196,6 +1362,60 @@ async def test_execute_step_defers_research_commit_until_verification_success():
         agent.verifier.verify = original_verify
 
 
+def test_execute_step_uses_conservative_vision_recovery_for_ui_failure():
+    async def run():
+        agent = MoonwalkAgentV2(use_planning=False, persist=False)
+        step = (
+            PlanBuilder("Click compose")
+            .add_step("Click compose", "browser_click_match", {"query": "Compose"})
+            .build()
+            .steps[0]
+        )
+
+        original_execute = tool_registry.execute
+        original_verify_with_visual = agent.verifier.verify_with_visual
+        calls = []
+
+        async def _tracking_execute(name, args):
+            calls.append((name, dict(args) if isinstance(args, dict) else args))
+            if name == "browser_click_match":
+                return json.dumps({"ok": False, "message": "Could not find element", "error_code": "element_not_found"})
+            if name == "read_screen":
+                return "The Compose button is visible around coordinates (420, 180)."
+            if name == "click_element":
+                return "Clicked at (420, 180)"
+            return await original_execute(name, args)
+
+        async def _verify_with_visual(**kwargs):
+            if kwargs["tool_name"] == "browser_click_match":
+                return VerificationResult(
+                    success=False,
+                    confidence=0.95,
+                    message="browser_click_match failed: Could not find element",
+                    should_retry=True,
+                )
+            if kwargs["tool_name"] == "click_element":
+                return VerificationResult(success=True, confidence=0.9, message="vision recovery click verified")
+            return VerificationResult(success=True, confidence=0.9, message="ok")
+
+        tool_registry.execute = _tracking_execute
+        agent.verifier.verify_with_visual = _verify_with_visual
+        try:
+            ok = await agent._execute_step(step, WorldState(active_app="Google Chrome"), ws_callback=None)
+            assert ok is True
+            call_names = [name for name, _ in calls]
+            assert "browser_click_match" in call_names
+            assert "read_screen" in call_names
+            assert "click_element" in call_names
+            assert call_names.index("read_screen") > call_names.index("browser_click_match")
+            assert call_names.index("click_element") > call_names.index("read_screen")
+        finally:
+            tool_registry.execute = original_execute
+            agent.verifier.verify_with_visual = original_verify_with_visual
+
+    asyncio.run(run())
+
+
 def test_working_memory_dedupes_research_snippets():
     memory = WorkingMemory()
     memory.log_research_snippet(
@@ -1278,6 +1498,22 @@ async def test_research_document_synthesis_from_snippets():
         snippets=snippets,
     )
     assert "Housing Systems in the UK" in synthesized
+
+
+def test_non_research_document_body_synthesis_from_title():
+    async def run():
+        agent = MoonwalkAgentV2(use_planning=False, persist=False)
+        synthesized = await agent._synthesize_document_body(
+            provider=_FakeProvider(),
+            title="Fascinating Facts About Octopuses",
+            user_text="proceed",
+            task_summary="Create a Google Document about a random topic",
+        )
+        assert synthesized
+        assert "Housing Systems in the UK" in synthesized
+        assert agent._looks_like_contentful_doc_task("proceed", "Create a Google Document about a random topic") is True
+
+    asyncio.run(run())
 
 
 async def test_template_pack_tool_filter_fallback():
@@ -1942,6 +2178,8 @@ def test_research_brief_pack_match():
 async def main():
     await test_response_contract_aliases()
     print("✓ response tool aliases")
+    await test_response_contract_cards_payloads()
+    print("✓ response cards payloads")
     await test_file_tools_reliability()
     print("✓ file tool reliability")
     test_selector_coverage()

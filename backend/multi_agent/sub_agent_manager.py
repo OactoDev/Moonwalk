@@ -22,7 +22,7 @@ print = partial(print, flush=True)
 
 from agent.planner import Milestone, MilestonePlan, MilestoneStatus
 from multi_agent import SubAgentConfig, SubAgentResult, SubAgentStatus
-from multi_agent.remote_executor import RemoteExecutor
+from multi_agent.remote_executor import RemoteExecutor, _is_suspend_signal
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -255,6 +255,10 @@ class SubAgentManager:
             )
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, Exception) and _is_suspend_signal(result):
+                raise result
 
         # Convert exceptions to failed results
         final_results: List[SubAgentResult] = []

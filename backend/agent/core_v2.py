@@ -33,12 +33,14 @@ from agent.planner import ExecutionStep, StepStatus
 from agent.planner import MilestonePlan, Milestone, MilestoneStatus
 from agent.task_planner import TaskPlanner
 from agent.verifier import get_verifier
+from agent.vision_recovery import attempt_vision_recovery, should_attempt_vision_recovery
 from agent.memory import ConversationMemory, UserPreferences, TaskStore, UserProfile, WorkingMemory
 from tools.selector import get_tool_selector, set_tool_gateway_context
 from tools import registry as tool_registry
 from providers.router import ModelRouter
 from providers import LLMProvider
 import agent.perception as perception
+from runtime_state import runtime_state_store
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -361,7 +363,12 @@ class MoonwalkAgentV2:
         self._pending_plan: Optional[PendingPlanState] = None
         self._pending_execution: Optional[PendingExecutionState] = None
         self._last_opened_url: str = ""
-        
+
+        # Perception cache: (timestamp, env_dict) — shared across the current
+        # milestone run. Invalidated whenever a UI-mutating tool executes.
+        self._perception_cache: Optional[tuple[float, dict]] = None
+        self._perception_cache_valid: bool = False
+
         # Configuration
         self.use_planning = use_planning
 
@@ -768,6 +775,7 @@ class MoonwalkAgentV2:
         print(f"\n[AgentV2] ═══ New Request ═══")
         print(f"[AgentV2] Text: '{user_text}'")
         print(f"[AgentV2] Context: app={context.active_app}, title={context.window_title}")
+        runtime_state_store.start_request(query=user_text)
 
         # Record user turn in conversation memory (for multi-turn context)
         self.conversation.add_user(user_text)
@@ -1232,8 +1240,51 @@ class MoonwalkAgentV2:
     #  Adaptive Plan Execution (LLM-in-the-loop)
     # ═══════════════════════════════════════════════════════════════
 
-    async def _perceive_environment(self, followup_inputs: Optional[list[str]] = None) -> dict:
-        """Quick perception of the current desktop/browser state for step reasoning."""
+    async def _perceive_environment(
+        self,
+        followup_inputs: Optional[list[str]] = None,
+        force_fresh: bool = False,
+    ) -> dict:
+        """Quick perception of the current desktop/browser state for step reasoning.
+
+        Results are cached for up to 500 ms when no UI-mutating tool has run
+        since the last call.  This avoids redundant osascript round-trips on
+        read-heavy / research milestones where the desktop state is stable.
+        Pass force_fresh=True (or call invalidate_perception_cache()) to bypass.
+        """
+        now = _time.time()
+
+        # ── Cache hit: return a shallow copy without re-running osascript ──
+        if (
+            not force_fresh
+            and self._perception_cache_valid
+            and self._perception_cache is not None
+            and (now - self._perception_cache[0]) < 0.5
+        ):
+            base = dict(self._perception_cache[1])
+            # Always overlay dynamic working-memory fields (they change fast)
+            last_typed_text = self.working_memory.get_last_typed_text()
+            if last_typed_text:
+                base["last_typed_text"] = last_typed_text[:500]
+            search_leads = self.working_memory.get_search_leads()
+            if search_leads:
+                base["search_lead_count"] = len(search_leads)
+                top_leads = []
+                for lead in search_leads[-3:]:
+                    title = str(lead.get("title", "")).strip()
+                    domain = str(lead.get("domain", "")).strip()
+                    status = "opened" if lead.get("opened") else "unopened"
+                    row = " | ".join(part for part in (title, domain, status) if part)
+                    if row:
+                        top_leads.append(row[:180])
+                if top_leads:
+                    base["search_leads"] = " || ".join(top_leads)
+            if followup_inputs:
+                base["user_followups"] = " || ".join(text[:200] for text in followup_inputs if text)
+            print("[AgentV2] ⚡ Perception cache hit")
+            return base
+
+        # ── Cache miss: run osascript layers in parallel ──
         env: dict = {}
         try:
             active_app, window_title, clipboard = await asyncio.gather(
@@ -1255,6 +1306,11 @@ class MoonwalkAgentV2:
                     env["selected_text"] = selected_text[:500]
         except Exception as e:
             print(f"[AgentV2] ⚠ Perception failed: {e}")
+
+        # ── Store in cache ──
+        self._perception_cache = (_time.time(), dict(env))
+        self._perception_cache_valid = True
+
         if followup_inputs:
             env["user_followups"] = " || ".join(text[:200] for text in followup_inputs if text)
         last_typed_text = self.working_memory.get_last_typed_text()
@@ -1274,6 +1330,10 @@ class MoonwalkAgentV2:
             if top_leads:
                 env["search_leads"] = " || ".join(top_leads)
         return env
+
+    def _invalidate_perception_cache(self) -> None:
+        """Invalidate the perception cache after a UI-mutating tool call."""
+        self._perception_cache_valid = False
 
     # ═══════════════════════════════════════════════════════════════
     #  Milestone-Based Execution (LLM micro-loop per milestone)
@@ -1333,44 +1393,15 @@ class MoonwalkAgentV2:
 
         is_research = self._looks_like_research_doc_task(user_text, plan.task_summary or "")
 
-        # Track whether the last tool was UI-mutating (drives passive visual injection)
-        last_tool_was_ui_mutating = False
-
-        async def milestone_visual_context() -> str:
-            """Gather DOM snapshot + screenshot description for passive injection."""
-            parts: list[str] = []
-            try:
-                from browser.store import browser_store
-                snap = browser_store.get_snapshot()
-                if snap and snap.elements:
-                    dom_lines = [f"Page: {snap.title} ({snap.url})"]
-                    for el in snap.elements[:30]:
-                        label = el.primary_label()[:60] if el.primary_label() else el.tag
-                        dom_lines.append(f"  [{el.ref_id}] {el.role or el.tag}: {label}")
-                    parts.append("\n".join(dom_lines))
-            except Exception as e:
-                print(f"[AgentV2] ⚠ DOM snapshot for visual context failed: {e}")
-
-            try:
-                screenshot_path = await perception.capture_screenshot()
-                if screenshot_path:
-                    parts.append(f"Screenshot captured: {screenshot_path}")
-            except Exception as e:
-                print(f"[AgentV2] ⚠ Screenshot for visual context failed: {e}")
-
-            return "\n".join(parts) if parts else ""
+        # Reset perception cache at the start of each execution run so we always
+        # get a fresh read on the first turn of a new request.
+        self._invalidate_perception_cache()
 
         async def milestone_env_perceiver() -> dict:
-            env = await self._perceive_environment(followup_inputs=followup_inputs)
-            # Passive visual injection: only after UI-mutating tools
-            if last_tool_was_ui_mutating:
-                try:
-                    visual = await milestone_visual_context()
-                    if visual:
-                        env["visual_state"] = visual[:1500]
-                except Exception as e:
-                    print(f"[AgentV2] ⚠ Passive visual injection failed: {e}")
-            return env
+            # The perception cache handles deduplication internally.
+            # When a UI-mutating tool ran, _invalidate_perception_cache() is
+            # called by tool_executor so the next call here goes to osascript.
+            return await self._perceive_environment(followup_inputs=followup_inputs)
 
         # Build tool-executor closure that reuses the existing step infrastructure
         async def tool_executor(tool: str, args: dict) -> tuple[str, bool]:
@@ -1401,6 +1432,24 @@ class MoonwalkAgentV2:
                             print(f"[AgentV2] 📝 Synthesized research for {tool} ({len(synthesized)} chars)")
                     except Exception as e:
                         print(f"[AgentV2] ⚠ Research synthesis failed: {e}")
+            elif (
+                tool == "gdocs_create"
+                and target_field
+                and not args.get(target_field)
+                and self._looks_like_contentful_doc_task(user_text, plan.task_summary or "")
+            ):
+                try:
+                    synthesized = await self._synthesize_document_body(
+                        provider=provider,
+                        title=str(args.get("title", "") or ""),
+                        user_text=user_text,
+                        task_summary=plan.task_summary or "",
+                    )
+                    if synthesized:
+                        args[target_field] = synthesized
+                        print(f"[AgentV2] 📝 Synthesized document body for {tool} ({len(synthesized)} chars)")
+                except Exception as e:
+                    print(f"[AgentV2] ⚠ Document synthesis failed: {e}")
 
             temp_step = ExecutionStep(
                 id=0, tool=tool, args=dict(args),
@@ -1438,9 +1487,11 @@ class MoonwalkAgentV2:
                 milestone_step_result_idx += 1
                 milestone_step_results[milestone_step_result_idx] = result
 
-            # Track UI-mutating tools for passive visual injection
+            # Invalidate perception cache after any UI-mutating action so the
+            # next env_perceiver call gets a fresh osascript read.
             from agent.verifier import _UI_MUTATING_TOOLS
-            last_tool_was_ui_mutating = tool in _UI_MUTATING_TOOLS
+            if tool in _UI_MUTATING_TOOLS:
+                self._invalidate_perception_cache()
 
             return (result, success)
 
@@ -1634,6 +1685,12 @@ class MoonwalkAgentV2:
         research_terms = ("research", "investigate", "analyze", "analyse", "compare", "study", "find", "look up", "best")
         doc_terms = ("document", "report", "write up", "write-up", "brief", "summary", "paper", "article")
         return any(term in text for term in research_terms) and any(term in text for term in doc_terms)
+
+    def _looks_like_contentful_doc_task(self, user_text: str, task_summary: str) -> bool:
+        text = f"{user_text or ''} {task_summary or ''}".lower()
+        doc_terms = ("document", "report", "google doc", "google document", "article", "brief", "paper")
+        content_terms = ("about", "regarding", "on ", "filled", "populate", "content", "write", "topic", "random")
+        return any(term in text for term in doc_terms) and any(term in text for term in content_terms)
 
     def _build_research_stream_lines(self, content_text: str, max_lines: int = 3) -> list[str]:
         lines: list[str] = []
@@ -1943,6 +2000,36 @@ class MoonwalkAgentV2:
             text = text.strip("`")
         return text[:14000]
 
+    async def _synthesize_document_body(
+        self,
+        provider: LLMProvider,
+        *,
+        title: str,
+        user_text: str,
+        task_summary: str,
+    ) -> str:
+        topic = str(title or task_summary or user_text or "Interesting Topic").strip()
+        prompt = (
+            "Write a concise but complete document for a new Google Doc.\n"
+            f"Request: {user_text or task_summary}\n"
+            f"Document title/topic: {topic}\n\n"
+            "Requirements:\n"
+            "- Use markdown headings.\n"
+            "- Include a short introduction, 3-4 informative sections, and a brief conclusion.\n"
+            "- Be factual when possible and reasonable when the prompt is open-ended.\n"
+            "- Return only the document text.\n"
+        )
+        response = await provider.generate(
+            messages=[{"role": "user", "parts": [{"text": prompt}]}],
+            system_prompt="You write clear, useful document drafts for end users.",
+            tools=[],
+            temperature=0.6,
+        )
+        text = (response.text or "").strip() if response else ""
+        if text.startswith("```"):
+            text = text.strip("`")
+        return text[:12000]
+
     def _remember_opened_url(self, step: ExecutionStep, result: str) -> None:
         if step.tool == "open_url":
             candidate = str(step.args.get("url") or "").strip()
@@ -2040,6 +2127,40 @@ class MoonwalkAgentV2:
 
         return retry_result
 
+    async def _wait_for_snapshot_change(self, timeout: float = 1.5) -> None:
+        """Poll until the browser snapshot changes (URL or version) or timeout expires.
+
+        Replaces the hard asyncio.sleep(BROWSER_NAV_SETTLE_S) after navigation
+        actions. On fast page loads the loop exits after 200-500ms; on slow
+        loads it caps at ``timeout`` seconds, matching the old behaviour exactly.
+        Falls back to a plain sleep when the browser bridge is not connected.
+        """
+        try:
+            from browser.store import browser_store
+        except Exception:
+            # No browser extension — plain sleep as safeguard
+            await asyncio.sleep(timeout)
+            return
+
+        snap_before = browser_store.get_snapshot()
+        url_before = getattr(snap_before, "url", None) or ""
+        ver_before = id(snap_before)  # identity changes when store updates
+
+        deadline = _time.monotonic() + timeout
+        poll_interval = 0.1  # 100 ms
+
+        while _time.monotonic() < deadline:
+            await asyncio.sleep(poll_interval)
+            snap_now = browser_store.get_snapshot()
+            url_now = getattr(snap_now, "url", None) or ""
+            if snap_now is not None and (id(snap_now) != ver_before or url_now != url_before):
+                waited = timeout - (deadline - _time.monotonic())
+                print(f"[AgentV2] ⚡ Smart settle resolved in ~{waited:.2f}s (target {timeout}s)")
+                return
+
+        # Timeout reached — page didn't push a new snapshot; continue anyway
+        print(f"[AgentV2] ⏱ Smart settle timed out after {timeout}s")
+
     async def _execute_step(
         self,
         step: ExecutionStep,
@@ -2105,7 +2226,7 @@ class MoonwalkAgentV2:
             # snapshot refresh so the next browser_read_page reads the search
             # results instead of whatever tab was previously active.
             if step.tool == "web_search":
-                await asyncio.sleep(BROWSER_NAV_SETTLE_S)
+                await self._wait_for_snapshot_change(timeout=BROWSER_NAV_SETTLE_S)
                 try:
                     await tool_registry.execute("browser_refresh_refs", {})
                 except Exception:
@@ -2117,7 +2238,7 @@ class MoonwalkAgentV2:
             if step.tool == "find_and_act" and str(step.args.get("action", "")).lower() == "click":
                 should_refresh_after_nav = True
             if should_refresh_after_nav:
-                await asyncio.sleep(BROWSER_NAV_SETTLE_S)
+                await self._wait_for_snapshot_change(timeout=BROWSER_NAV_SETTLE_S)
                 try:
                     await tool_registry.execute("browser_refresh_refs", {})
                 except Exception:
@@ -2242,6 +2363,51 @@ class MoonwalkAgentV2:
                 total_elapsed = _time.time() - t_start
                 print(f"[AgentV2] └─ ✓ Step {step.id} COMPLETED ({total_elapsed:.2f}s)")
                 return True
+
+            if should_attempt_vision_recovery(
+                tool_name=step.tool,
+                tool_args=step.args,
+                tool_result=result,
+                verification_message=verification.message,
+                verification_confidence=verification.confidence,
+                should_retry=verification.should_retry,
+            ):
+                print(f"[AgentV2] │  Attempting conservative vision recovery for {step.tool}…")
+
+                async def _vision_tool_executor(name: str, args: dict) -> str:
+                    return await tool_registry.execute(name, args)
+
+                recovery = await attempt_vision_recovery(
+                    tool_name=step.tool,
+                    tool_args=step.args,
+                    tool_executor=_vision_tool_executor,
+                )
+                if recovery.success and recovery.tool_name:
+                    recovery_verification = await self.verifier.verify_with_visual(
+                        tool_name=recovery.tool_name,
+                        tool_args=recovery.tool_args or {},
+                        tool_result=recovery.result,
+                        success_criteria=step.success_criteria,
+                        get_current_state=self._get_quick_state,
+                        get_visual_state=self._get_visual_state,
+                    )
+                    if recovery_verification.success:
+                        if step.tool not in ("send_response", "await_reply"):
+                            self.working_memory.log_action(
+                                tool=step.tool,
+                                args=step.args,
+                                result=recovery.result,
+                                success=True,
+                            )
+                        step.status = StepStatus.COMPLETED
+                        step.result = recovery.result
+                        print(f"[AgentV2] │  Vision recovery succeeded: {recovery.reason}")
+                        total_elapsed = _time.time() - t_start
+                        print(f"[AgentV2] └─ ✓ Step {step.id} COMPLETED ({total_elapsed:.2f}s)")
+                        return True
+                    print(f"[AgentV2] │  Vision recovery did not verify: {recovery_verification.message}")
+                elif recovery.attempted:
+                    print(f"[AgentV2] │  Vision recovery could not localize a safe target.")
             
             # Verification failed - try retry or fallback
             if verification.should_retry and step.retries < step.max_retries:

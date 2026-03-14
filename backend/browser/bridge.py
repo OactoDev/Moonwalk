@@ -10,6 +10,7 @@ import time
 from typing import Dict, List, Optional
 from .models import ActionRequest, ActionResult, DomChangeEvent, PageSnapshot
 from .store import browser_store
+from runtime_state import runtime_state_store
 
 
 class BrowserBridge:
@@ -45,6 +46,7 @@ class BrowserBridge:
         self._connected_session_id = session_id
         self._extension_name = extension_name
         self._last_seen_at = time.time()
+        runtime_state_store.mark_browser_connected(session_id=session_id)
 
     def touch(self) -> None:
         self._last_seen_at = time.time()
@@ -53,6 +55,7 @@ class BrowserBridge:
         browser_store.upsert_snapshot(snapshot)
         self._connected_session_id = snapshot.session_id
         self._last_seen_at = time.time()
+        runtime_state_store.register_browser_snapshot(snapshot)
 
     def queue_action(self, request: ActionRequest) -> ActionResult:
         if not self.is_connected():
@@ -67,7 +70,7 @@ class BrowserBridge:
         if not snapshot:
             # Allow snapshot-independent actions (refresh_snapshot, evaluate_js)
             # to be queued even before the first snapshot arrives.
-            _snapshotless_actions = {"refresh_snapshot", "evaluate_js"}
+            _snapshotless_actions = {"refresh_snapshot", "evaluate_js", "extract_data", "extract_readability"}
             if request.action in _snapshotless_actions and (request.session_id or self._connected_session_id):
                 request.session_id = request.session_id or self._connected_session_id or ""
                 request.action_id = request.action_id or f"act_{int(time.time() * 1000)}_{secrets.token_hex(4)}"
@@ -91,6 +94,12 @@ class BrowserBridge:
 
         request.session_id = request.session_id or snapshot.session_id
         request.action_id = request.action_id or f"act_{int(time.time() * 1000)}_{secrets.token_hex(4)}"
+        if request.action in {"evaluate_js", "extract_data", "extract_readability"}:
+            request.metadata = {
+                **request.metadata,
+                "tab_id": request.metadata.get("tab_id", snapshot.tab_id),
+                "generation": request.metadata.get("generation", str(snapshot.generation)),
+            }
         if request.action == "refresh_snapshot":
             request.metadata = {
                 **request.metadata,
@@ -146,6 +155,18 @@ class BrowserBridge:
         if result.action_id:
             self._latest_result_by_action_id[result.action_id] = result
         self._last_seen_at = time.time()
+        runtime_state_store.record_browser_action_result(result)
+        details = result.details or {}
+        if result.action == "extract_readability" and isinstance(details, dict):
+            raw_result = details.get("result", "")
+            if raw_result:
+                try:
+                    import json
+                    payload = json.loads(raw_result)
+                except Exception:
+                    payload = {"ok": False, "message": "invalid_readability_payload"}
+                if isinstance(payload, dict):
+                    runtime_state_store.record_readability_extraction(payload)
 
     def latest_action_result(self, action_id: str) -> Optional[ActionResult]:
         return self._latest_result_by_action_id.get(action_id)
@@ -161,6 +182,7 @@ class BrowserBridge:
     def disconnect(self) -> None:
         self._connected_session_id = None
         self._extension_name = ""
+        runtime_state_store.mark_browser_disconnected()
 
     def reset(self) -> None:
         self._connected_session_id = None
@@ -169,6 +191,7 @@ class BrowserBridge:
         self._latest_result_by_action_id.clear()
         self._latest_dom_change_by_action_id.clear()
         self._extension_name = ""
+        runtime_state_store.mark_browser_disconnected()
 
 
 browser_bridge = BrowserBridge()

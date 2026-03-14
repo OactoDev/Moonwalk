@@ -734,236 +734,351 @@ function startMutationObserver(sessionId, tabId) {
 
 // -- Message Handling --
 
+// ── Moonwalk Agent Click Pointer ─────────────────────────────────
+const CLICK_POINTER_ID = "mw-click-pointer";
+const CLICK_POINTER_STYLE_ID = "mw-click-pointer-style";
+let _clickPointerEl = null;
+let _clickPointerBurstTimer = null;
+let _clickPointerOutroTimer = null;
+
+function ensureClickPointerStyles() {
+  if (document.getElementById(CLICK_POINTER_STYLE_ID)) return;
+  const style = document.createElement("style");
+  style.id = CLICK_POINTER_STYLE_ID;
+  style.textContent = `
+    @keyframes mw-ptr-intro {
+      0%   { opacity: 0; transform: scale(0.3); }
+      65%  { opacity: 1; transform: scale(1.18); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+    @keyframes mw-ptr-dwell {
+      0%, 100% { transform: scale(1); }
+      50%       { transform: scale(1.08); }
+    }
+    @keyframes mw-ptr-ring-expand {
+      0%   { transform: scale(0.7); opacity: 0.9; }
+      100% { transform: scale(2.2); opacity: 0; }
+    }
+    @keyframes mw-ptr-burst {
+      0%   { transform: scale(0); opacity: 1; }
+      60%  { transform: scale(2.6); opacity: 0.5; }
+      100% { transform: scale(3.8); opacity: 0; }
+    }
+    @keyframes mw-ptr-outro {
+      0%   { opacity: 1; transform: scale(1); }
+      100% { opacity: 0; transform: scale(0.5); }
+    }
+    #${CLICK_POINTER_ID} {
+      position: fixed;
+      width: 0;
+      height: 0;
+      pointer-events: none;
+      z-index: 2147483647;
+      will-change: transform;
+      /* translate is set dynamically via left/top */
+    }
+    #${CLICK_POINTER_ID} .mw-ptr-inner {
+      position: absolute;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: rgba(99, 102, 241, 1);
+      box-shadow:
+        0 0 0 2px rgba(255,255,255,0.9),
+        0 0 12px 0 rgba(99, 102, 241, 0.6);
+      transform: translate(-50%, -50%) scale(0);
+      transform-origin: center;
+      animation: mw-ptr-intro 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+    }
+    #${CLICK_POINTER_ID}.dwell .mw-ptr-inner {
+      animation: mw-ptr-dwell 1.2s ease-in-out infinite;
+      transform: translate(-50%, -50%) scale(1);
+    }
+    #${CLICK_POINTER_ID} .mw-ptr-ring {
+      position: absolute;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      border: 1.5px solid rgba(99, 102, 241, 0.55);
+      transform: translate(-50%, -50%) scale(0.7);
+      transform-origin: center;
+      animation: mw-ptr-ring-expand 1.1s ease-out infinite;
+    }
+    #${CLICK_POINTER_ID} .mw-ptr-burst {
+      position: absolute;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: rgba(99, 102, 241, 0.45);
+      transform: translate(-50%, -50%) scale(0);
+      transform-origin: center;
+      opacity: 0;
+      pointer-events: none;
+    }
+    #${CLICK_POINTER_ID}.burst .mw-ptr-burst {
+      animation: mw-ptr-burst 0.5s cubic-bezier(0.23, 1, 0.32, 1) forwards;
+    }
+    #${CLICK_POINTER_ID}.outro {
+      animation: mw-ptr-outro 0.4s ease-in forwards;
+    }
+  `;
+  (document.head || document.documentElement).appendChild(style);
+}
+
+function showClickPointer(pageX, pageY) {
+  ensureClickPointerStyles();
+
+  // Convert page → viewport coordinates
+  const vx = pageX - window.scrollX;
+  const vy = pageY - window.scrollY;
+
+  // Clean up any running outro
+  if (_clickPointerOutroTimer) {
+    clearTimeout(_clickPointerOutroTimer);
+    _clickPointerOutroTimer = null;
+  }
+
+  if (_clickPointerEl) {
+    // Move existing pointer smoothly
+    _clickPointerEl.style.left = vx + "px";
+    _clickPointerEl.style.top  = vy + "px";
+    _clickPointerEl.classList.remove("outro", "burst");
+    // Re-trigger dwell
+    void _clickPointerEl.offsetWidth;
+    _clickPointerEl.classList.add("dwell");
+    return;
+  }
+
+  const ptr = document.createElement("div");
+  ptr.id = CLICK_POINTER_ID;
+  ptr.style.left = vx + "px";
+  ptr.style.top  = vy + "px";
+  ptr.innerHTML = `
+    <div class="mw-ptr-ring"></div>
+    <div class="mw-ptr-burst"></div>
+    <div class="mw-ptr-inner"></div>
+  `;
+  (document.body || document.documentElement).appendChild(ptr);
+  _clickPointerEl = ptr;
+
+  // Switch to dwell animation after intro completes
+  setTimeout(function() {
+    if (_clickPointerEl) _clickPointerEl.classList.add("dwell");
+  }, 420);
+}
+
+function triggerClickBurst() {
+  if (!_clickPointerEl) return;
+  _clickPointerEl.classList.remove("dwell");
+  _clickPointerEl.classList.add("burst");
+
+  // Start outro shortly after burst
+  _clickPointerOutroTimer = setTimeout(function() {
+    if (!_clickPointerEl) return;
+    _clickPointerEl.classList.add("outro");
+    _clickPointerOutroTimer = setTimeout(function() {
+      if (_clickPointerEl) {
+        _clickPointerEl.remove();
+        _clickPointerEl = null;
+      }
+    }, 420);
+  }, 350);
+}
+
 // ── Moonwalk Research Highlight Styles ──
 const HIGHLIGHT_STYLE_ID = "moonwalk-research-highlight-style";
 const RESEARCH_OVERLAY_ID = "moonwalk-research-overlay";
 let _researchOverlayTimer = null;
+
 
 function ensureHighlightStyles() {
   if (document.getElementById(HIGHLIGHT_STYLE_ID)) return;
   const style = document.createElement("style");
   style.id = HIGHLIGHT_STYLE_ID;
   style.textContent = `
-    @keyframes moonwalk-pulse {
-      0%   { box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.6); }
-      50%  { box-shadow: 0 0 8px 4px rgba(99, 102, 241, 0.3); }
-      100% { box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.6); }
+    /* ── Keyframes ── */
+    @keyframes mw-scan {
+      0%   { background-position: -150% 0; }
+      100% { background-position: 250% 0; }
     }
-    .moonwalk-highlight-reading {
-      outline: 2px solid rgba(99, 102, 241, 0.7) !important;
-      background-color: rgba(99, 102, 241, 0.08) !important;
-      animation: moonwalk-pulse 1.5s ease-in-out infinite;
-      transition: outline 0.3s, background-color 0.3s;
+    @keyframes mw-pulse-border {
+      0%, 100% { opacity: 0.5; }
+      50%       { opacity: 1; }
     }
-    .moonwalk-highlight-reading-text {
-      background-color: rgba(245, 158, 11, 0.18) !important;
-      outline: 1px solid rgba(245, 158, 11, 0.55) !important;
+    @keyframes mw-intro {
+      0%   { opacity: 0; transform: scaleY(0.6) scaleX(0.97); }
+      60%  { opacity: 1; transform: scaleY(1.04) scaleX(1); }
+      100% { opacity: 1; transform: scaleY(1) scaleX(1); }
     }
-    #${RESEARCH_OVERLAY_ID} {
-      position: fixed;
-      top: 18px;
-      right: 18px;
-      width: 340px;
-      max-width: calc(100vw - 32px);
-      max-height: min(52vh, 420px);
-      display: none;
-      z-index: 2147483647;
-      overflow: hidden;
-      border: 1px solid rgba(15, 23, 42, 0.24);
-      background:
-        linear-gradient(180deg, rgba(255, 255, 255, 0.97), rgba(248, 250, 252, 0.97));
-      color: #0f172a;
-      box-shadow: 0 18px 48px rgba(15, 23, 42, 0.18);
-      backdrop-filter: blur(10px);
-      border-radius: 14px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      pointer-events: none;
+    @keyframes mw-outro {
+      0%   { opacity: 1; transform: scale(1); }
+      100% { opacity: 0; transform: scaleY(0.7) scaleX(0.98); }
     }
-    #${RESEARCH_OVERLAY_ID}.visible {
-      display: block;
+
+    /* ── Shared base: position:relative so ::before can use inset ── */
+    .mw-hl, .mw-hl-text {
+      position: relative !important;
+      isolation: isolate !important;
     }
-    #${RESEARCH_OVERLAY_ID} .moonwalk-overlay-shell {
-      padding: 14px 14px 12px;
-      display: grid;
-      gap: 10px;
+
+    /* ── Pseudo-overlay (covers element + 5px padding, never shifts layout) ── */
+    .mw-hl::before, .mw-hl-text::before {
+      content: '' !important;
+      position: absolute !important;
+      inset: -5px -6px !important;
+      border-radius: 8px !important;
+      pointer-events: none !important;
+      z-index: 2147483640 !important;
+      transform-origin: center center !important;
+      /* background + animation set per-phase below */
     }
-    #${RESEARCH_OVERLAY_ID} .moonwalk-overlay-head {
-      display: grid;
-      gap: 2px;
-      padding-bottom: 8px;
-      border-bottom: 1px solid rgba(15, 23, 42, 0.1);
+
+    /* ── Phase: intro ── */
+    .mw-hl--intro::before {
+      background: linear-gradient(
+        90deg,
+        transparent 0%,
+        rgba(99, 102, 241, 0.18) 40%,
+        rgba(99, 102, 241, 0.30) 55%,
+        rgba(99, 102, 241, 0.18) 70%,
+        transparent 100%
+      ) !important;
+      background-size: 200% 100% !important;
+      box-shadow: inset 0 0 0 1.5px rgba(99, 102, 241, 0.30) !important;
+      animation: mw-intro 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) forwards !important;
     }
-    #${RESEARCH_OVERLAY_ID} .moonwalk-overlay-kicker {
-      font-size: 10px;
-      letter-spacing: 0.16em;
-      color: #475569;
+    .mw-hl-text--intro::before {
+      background: linear-gradient(
+        90deg,
+        transparent 0%,
+        rgba(245, 158, 11, 0.15) 40%,
+        rgba(245, 158, 11, 0.26) 55%,
+        rgba(245, 158, 11, 0.15) 70%,
+        transparent 100%
+      ) !important;
+      background-size: 200% 100% !important;
+      box-shadow: inset 0 0 0 1.5px rgba(245, 158, 11, 0.28) !important;
+      animation: mw-intro 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) forwards !important;
     }
-    #${RESEARCH_OVERLAY_ID} .moonwalk-overlay-title {
-      font-size: 15px;
-      line-height: 1.3;
-      font-weight: 600;
-      color: #0f172a;
+
+    /* ── Phase: reading (looping scanner + pulsing border) ── */
+    .mw-hl--reading::before {
+      background: linear-gradient(
+        90deg,
+        transparent    0%,
+        rgba(99, 102, 241, 0.06) 20%,
+        rgba(99, 102, 241, 0.22) 45%,
+        rgba(99, 102, 241, 0.36) 50%,
+        rgba(99, 102, 241, 0.22) 55%,
+        rgba(99, 102, 241, 0.06) 80%,
+        transparent  100%
+      ) !important;
+      background-size: 220% 100% !important;
+      box-shadow:
+        inset 0 0 0 1.5px rgba(99, 102, 241, 0.28),
+        0 0 12px 0 rgba(99, 102, 241, 0.10) !important;
+      animation:
+        mw-scan 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite,
+        mw-pulse-border 2s ease-in-out infinite !important;
     }
-    #${RESEARCH_OVERLAY_ID} .moonwalk-overlay-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 8px 10px;
+    .mw-hl-text--reading::before {
+      background: linear-gradient(
+        90deg,
+        transparent    0%,
+        rgba(245, 158, 11, 0.05) 20%,
+        rgba(245, 158, 11, 0.18) 45%,
+        rgba(245, 158, 11, 0.30) 50%,
+        rgba(245, 158, 11, 0.18) 55%,
+        rgba(245, 158, 11, 0.05) 80%,
+        transparent  100%
+      ) !important;
+      background-size: 220% 100% !important;
+      box-shadow:
+        inset 0 0 0 1.5px rgba(245, 158, 11, 0.25),
+        0 0 12px 0 rgba(245, 158, 11, 0.08) !important;
+      animation:
+        mw-scan 2s cubic-bezier(0.4, 0, 0.6, 1) infinite,
+        mw-pulse-border 2.4s ease-in-out infinite !important;
     }
-    #${RESEARCH_OVERLAY_ID} .moonwalk-overlay-field {
-      min-width: 0;
-      display: grid;
-      gap: 3px;
-    }
-    #${RESEARCH_OVERLAY_ID} .moonwalk-overlay-field-full {
-      grid-column: 1 / -1;
-    }
-    #${RESEARCH_OVERLAY_ID} .moonwalk-overlay-label {
-      font-size: 10px;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-      color: #64748b;
-    }
-    #${RESEARCH_OVERLAY_ID} .moonwalk-overlay-value {
-      font-size: 12px;
-      line-height: 1.45;
-      color: #0f172a;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    #${RESEARCH_OVERLAY_ID} .moonwalk-overlay-snippet {
-      margin: 0;
-      font-size: 12px;
-      line-height: 1.5;
-      color: #1e293b;
-      white-space: pre-wrap;
-      overflow: hidden;
-      display: -webkit-box;
-      -webkit-box-orient: vertical;
-      -webkit-line-clamp: 8;
-    }
-    #${RESEARCH_OVERLAY_ID} .moonwalk-overlay-source {
-      word-break: break-word;
-      white-space: normal;
+
+    /* ── Phase: outro ── */
+    .mw-hl--outro::before, .mw-hl-text--outro::before {
+      animation: mw-outro 0.5s ease-in forwards !important;
     }
   `;
   (document.head || document.documentElement).appendChild(style);
 }
 
 function ensureResearchOverlay() {
+  // No overlay — the highlight itself is sufficient feedback
   ensureHighlightStyles();
-  let overlay = document.getElementById(RESEARCH_OVERLAY_ID);
-  if (overlay) return overlay;
-
-  overlay = document.createElement("div");
-  overlay.id = RESEARCH_OVERLAY_ID;
-  overlay.setAttribute("role", "status");
-  overlay.setAttribute("aria-live", "polite");
-  overlay.innerHTML = `
-    <div class="moonwalk-overlay-shell">
-      <div class="moonwalk-overlay-head">
-        <div class="moonwalk-overlay-kicker">MOONWALK</div>
-        <div class="moonwalk-overlay-title">Active reading</div>
-      </div>
-      <div class="moonwalk-overlay-grid">
-        <div class="moonwalk-overlay-field">
-          <div class="moonwalk-overlay-label">Tool</div>
-          <div class="moonwalk-overlay-value" data-moonwalk-field="tool"></div>
-        </div>
-        <div class="moonwalk-overlay-field">
-          <div class="moonwalk-overlay-label">Items</div>
-          <div class="moonwalk-overlay-value" data-moonwalk-field="itemCount"></div>
-        </div>
-        <div class="moonwalk-overlay-field moonwalk-overlay-field-full">
-          <div class="moonwalk-overlay-label">Title</div>
-          <div class="moonwalk-overlay-value" data-moonwalk-field="title"></div>
-        </div>
-        <div class="moonwalk-overlay-field moonwalk-overlay-field-full">
-          <div class="moonwalk-overlay-label">Source</div>
-          <div class="moonwalk-overlay-value moonwalk-overlay-source" data-moonwalk-field="sourceUrl"></div>
-        </div>
-        <div class="moonwalk-overlay-field moonwalk-overlay-field-full">
-          <div class="moonwalk-overlay-label">Snippet</div>
-          <pre class="moonwalk-overlay-snippet" data-moonwalk-field="snippet"></pre>
-        </div>
-      </div>
-    </div>
-  `;
-  (document.body || document.documentElement).appendChild(overlay);
-  return overlay;
+  return null;
 }
 
 function overlayFieldValue(overlay, field) {
-  return overlay.querySelector('[data-moonwalk-field="' + field + '"]');
+  return null;
 }
 
 function setOverlayField(overlay, field, value, fallback) {
-  const el = overlayFieldValue(overlay, field);
-  if (!el) return;
-  const text = String(value || fallback || "").trim();
-  el.textContent = text || fallback || "";
+  // no-op
 }
 
 function hideResearchOverlay() {
-  const overlay = document.getElementById(RESEARCH_OVERLAY_ID);
-  if (!overlay) return;
-  overlay.classList.remove("visible");
+  // no-op — overlay removed
 }
 
 function showResearchOverlay(details, durationMs) {
-  const overlay = ensureResearchOverlay();
-  const itemCount = Number(details?.itemCount || 0);
-  const tool = String(details?.tool || "").trim() || "browser_read";
-  const title = String(details?.title || "").trim() || document.title || "(untitled)";
-  const sourceUrl = String(details?.sourceUrl || "").trim() || window.location.href;
-  const snippet = String(details?.snippet || "").trim() || "No extracted snippet available.";
+  // no-op — overlay removed
+}
 
-  setOverlayField(overlay, "tool", tool, "browser_read");
-  setOverlayField(overlay, "itemCount", itemCount > 0 ? String(itemCount) : "visible", "visible");
-  setOverlayField(overlay, "title", title, "(untitled)");
-  setOverlayField(overlay, "sourceUrl", sourceUrl, window.location.href);
-  setOverlayField(overlay, "snippet", snippet, "No extracted snippet available.");
+// Apply the 3-phase highlight lifecycle to a single element with a stagger offset
+function _applyHighlightLifecycle(el, baseCls, staggerMs, durationMs) {
+  const introPhase   = baseCls + "--intro";
+  const readingPhase = baseCls + "--reading";
+  const outroPhase   = baseCls + "--outro";
+  const outroDuration = 500; // ms — matches mw-outro animation
+  const introToReading = 450; // ms — matches mw-intro duration
 
-  overlay.classList.add("visible");
+  // 1. Add base + intro (staggered)
+  setTimeout(function() {
+    el.classList.add(baseCls, introPhase);
 
-  if (_researchOverlayTimer) {
-    clearTimeout(_researchOverlayTimer);
-    _researchOverlayTimer = null;
-  }
-  if (durationMs > 0) {
-    _researchOverlayTimer = setTimeout(function() {
-      hideResearchOverlay();
-      _researchOverlayTimer = null;
-    }, durationMs);
-  }
+    // 2. Transition to reading phase after intro completes
+    setTimeout(function() {
+      el.classList.remove(introPhase);
+      el.classList.add(readingPhase);
+    }, introToReading);
+
+    // 3. Trigger outro phase before duration ends
+    var totalAfterStart = Math.max(durationMs - staggerMs - outroDuration, introToReading + 200);
+    setTimeout(function() {
+      el.classList.remove(readingPhase);
+      el.classList.add(outroPhase);
+
+      // 4. Clean up after outro animation completes
+      setTimeout(function() {
+        el.classList.remove(baseCls, outroPhase);
+      }, outroDuration + 50);
+    }, totalAfterStart);
+  }, staggerMs);
 }
 
 function highlightElements(agentIds, durationMs, mode, overlayDetails) {
   ensureHighlightStyles();
   durationMs = durationMs || 3000;
-  mode = mode || "reading"; // "reading" | "text"
-  const cls = mode === "text" ? "moonwalk-highlight-reading-text" : "moonwalk-highlight-reading";
+  mode = mode || "reading";
+  const baseCls = mode === "text" ? "mw-hl-text" : "mw-hl";
   const highlighted = [];
-  showResearchOverlay(overlayDetails || {}, durationMs);
 
   for (const aid of agentIds) {
     const el = lookupByAgentId(Number(aid));
     if (!el) continue;
-    el.classList.add(cls);
+    const stagger = highlighted.length * 80;
+    _applyHighlightLifecycle(el, baseCls, stagger, durationMs);
     highlighted.push(el);
-    // Scroll first highlighted element into view
     if (highlighted.length === 1) {
       el.scrollIntoView({ block: "center", behavior: "smooth" });
     }
-  }
-
-  // Auto-remove after duration
-  if (durationMs > 0) {
-    setTimeout(function() {
-      for (const el of highlighted) {
-        el.classList.remove(cls);
-      }
-    }, durationMs);
   }
 
   return highlighted.length;
@@ -974,25 +1089,93 @@ function highlightReadableContent(durationMs, overlayDetails) {
   durationMs = durationMs || 4000;
   const readableNodes = document.querySelectorAll(READABLE_SELECTOR);
   const highlighted = [];
-  showResearchOverlay(overlayDetails || {}, durationMs);
 
   for (const el of readableNodes) {
     if (!isVisible(el) || !isInViewport(el)) continue;
     if (!isReadableCandidate(el)) continue;
-    el.classList.add("moonwalk-highlight-reading-text");
+    const stagger = highlighted.length * 60;
+    _applyHighlightLifecycle(el, "mw-hl-text", stagger, durationMs);
     highlighted.push(el);
-    if (highlighted.length >= 30) break; // cap for performance
-  }
-
-  if (durationMs > 0) {
-    setTimeout(function() {
-      for (const el of highlighted) {
-        el.classList.remove("moonwalk-highlight-reading-text");
-      }
-    }, durationMs);
+    if (highlighted.length >= 30) break;
   }
 
   return highlighted.length;
+}
+
+const READABILITY_MIN_TEXT_CHARS = 200;
+const READABILITY_MAX_TEXT_CHARS = 12000;
+
+function normalizeReadabilityText(value) {
+  const normalized = String(value || "")
+    .replace(/\u00a0/g, " ")
+    .replace(/\r/g, "\n")
+    .split(/\n+/)
+    .map(function(line) {
+      return line.trim().replace(/\s+/g, " ");
+    })
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+  return normalized;
+}
+
+function extractReadabilityArticle() {
+  if (typeof Readability !== "function") {
+    return {
+      ok: false,
+      message: "Readability.js is not available in the content script.",
+      error: "missing_readability",
+    };
+  }
+
+  try {
+    const clonedDocument = document.cloneNode(true);
+    const article = new Readability(clonedDocument).parse();
+    if (!article) {
+      return {
+        ok: false,
+        message: "Readability could not parse the current page.",
+        error: "parse_failed",
+      };
+    }
+
+    const cleanText = normalizeReadabilityText(article.textContent || "");
+    const rawLength = cleanText.length;
+    if (rawLength < READABILITY_MIN_TEXT_CHARS) {
+      return {
+        ok: false,
+        message: "Readability returned too little readable text.",
+        error: "thin_content",
+        title: String(article.title || "").trim(),
+        excerpt: normalizeReadabilityText(article.excerpt || ""),
+        byline: normalizeReadabilityText(article.byline || "").slice(0, 240),
+        site_name: normalizeReadabilityText(article.siteName || "").slice(0, 160),
+        lang: String(document.documentElement?.lang || "").trim(),
+        text: cleanText,
+        content_length: rawLength,
+      };
+    }
+
+    const text = cleanText.slice(0, READABILITY_MAX_TEXT_CHARS);
+    return {
+      ok: true,
+      message: "Readability extracted readable page text.",
+      title: String(article.title || "").trim(),
+      excerpt: normalizeReadabilityText(article.excerpt || ""),
+      byline: normalizeReadabilityText(article.byline || "").slice(0, 240),
+      site_name: normalizeReadabilityText(article.siteName || "").slice(0, 160),
+      lang: String(document.documentElement?.lang || "").trim(),
+      text: text,
+      content_length: rawLength,
+      truncated: rawLength > text.length,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      message: "Readability extraction threw an error.",
+      error: String(error?.message || error),
+    };
+  }
 }
 
 chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
@@ -1057,6 +1240,109 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
          if (kix && kix.innerText) result = kix.innerText.substring(0, 8000);
          else if (document.body && document.body.innerText) result = document.body.innerText.substring(0, 8000);
          else if (document.documentElement && document.documentElement.innerText) result = document.documentElement.innerText.substring(0, 8000);
+      } else if (target === "gdocs_state") {
+         const titleInput =
+           document.querySelector('input.docs-title-input') ||
+           document.querySelector('input[aria-label="Document title"]') ||
+           document.querySelector('input[aria-label="Rename"]') ||
+           document.querySelector('input[placeholder="Untitled document"]');
+         const editor =
+           document.querySelector('.kix-appview-editor') ||
+           document.querySelector('[contenteditable="true"]') ||
+           document.querySelector('.docs-texteventtarget-iframe');
+         const editorText = editor && typeof editor.innerText === "string" ? editor.innerText.trim() : "";
+         result = JSON.stringify({
+           url: location.href,
+           title_value: titleInput ? (titleInput.value || '') : '',
+           title_visible: !!titleInput,
+           editor_ready: !!editor,
+           body_length: editorText.length,
+         });
+      } else if (typeof target === "string" && target.startsWith("gdocs_set_title:")) {
+         const titleInput =
+           document.querySelector('input.docs-title-input') ||
+           document.querySelector('input[aria-label="Document title"]') ||
+           document.querySelector('input[aria-label="Rename"]') ||
+           document.querySelector('input[placeholder="Untitled document"]');
+         if (!titleInput) {
+           result = "no-title-input";
+         } else {
+           const encoded = target.slice("gdocs_set_title:".length);
+           const title = decodeURIComponent(escape(atob(encoded)));
+           const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+           titleInput.focus();
+           if (valueSetter) valueSetter.call(titleInput, title);
+           else titleInput.value = title;
+           titleInput.dispatchEvent(new Event("input", { bubbles: true }));
+           titleInput.dispatchEvent(new Event("change", { bubbles: true }));
+           titleInput.blur();
+           result = titleInput.value || "";
+         }
+      } else if (target === "gdocs_focus_editor") {
+         const editor =
+           document.querySelector('textarea.kix-clipboard-capture-area') ||
+           document.querySelector('.docs-texteventtarget-iframe') ||
+           document.querySelector('.kix-appview-editor') ||
+           document.querySelector('[contenteditable="true"]');
+         if (!editor) {
+           result = "no-editor";
+         } else {
+           if (editor.contentWindow && editor.contentWindow.focus) editor.contentWindow.focus();
+           if (editor.focus) editor.focus();
+           if (editor.click) editor.click();
+           const active = document.activeElement;
+           result = active ? (active.tagName || "ok") : "ok";
+         }
+      } else if (target === "gdocs_click_editor") {
+         const clickTarget =
+           document.querySelector('.kix-page-paginated') ||
+           document.querySelector('.kix-page') ||
+           document.querySelector('.kix-appview-editor') ||
+           document.querySelector('.docs-texteventtarget-iframe') ||
+           document.querySelector('textarea.kix-clipboard-capture-area');
+         if (!clickTarget || !clickTarget.getBoundingClientRect) {
+           result = "no-editor";
+         } else {
+           const rect = clickTarget.getBoundingClientRect();
+           const clientX = rect.left + Math.max(24, Math.min(rect.width / 2, rect.width - 24));
+           const clientY = rect.top + Math.max(24, Math.min(rect.height / 2, rect.height - 24));
+           const node = document.elementFromPoint(clientX, clientY) || clickTarget;
+           ["mousemove", "mousedown", "mouseup", "click"].forEach((type) => {
+             node.dispatchEvent(new MouseEvent(type, {
+               bubbles: true,
+               cancelable: true,
+               view: window,
+               clientX,
+               clientY,
+               button: 0,
+             }));
+           });
+           const active = document.activeElement;
+           result = active ? (active.tagName || "ok") : "ok";
+         }
+      } else if (target === "gdocs_read_body") {
+         const selectors = [
+           '.kix-wordhtmlgenerator-word-node',
+           '.kix-lineview-text-block',
+           '.kix-paragraphrenderer',
+           '[role="textbox"]',
+           '.kix-appview-editor',
+         ];
+         const parts = [];
+         const seen = new Set();
+         for (const selector of selectors) {
+           const nodes = document.querySelectorAll(selector);
+           for (const node of nodes) {
+             const text = (node && node.innerText ? node.innerText : "").trim();
+             if (!text || text.length < 2 || seen.has(text)) continue;
+             if (/^File Edit View Insert/i.test(text)) continue;
+             seen.add(text);
+             parts.push(text);
+             if (parts.join("\n").length > 12000) break;
+           }
+           if (parts.join("\n").length > 12000) break;
+         }
+         result = parts.join("\n").slice(0, 12000);
       } else if (target === "gcal") {
          var chips = document.querySelectorAll('[data-eventid],[data-eventchip-action],.KF4T6b,.lKHqkb');
          var evs = [];
@@ -1074,6 +1360,10 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
     } catch (error) {
       sendResponse?.({ ok: false, error: String(error?.message || error) });
     }
+    return true;
+  }
+  if (message?.type === "moonwalk_extract_readability") {
+    sendResponse?.(extractReadabilityArticle());
     return true;
   }
   if (message?.type === "moonwalk_execute_action") {
@@ -1115,6 +1405,19 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
       count = highlightReadableContent(duration, overlayDetails);
     }
     sendResponse?.({ ok: true, highlighted: count, overlayVisible: true });
+    return true;
+  }
+  // ── Agent click pointer ──
+  if (message?.type === "moonwalk_show_click_pointer") {
+    const pageX = Number(message.pageX || 0);
+    const pageY = Number(message.pageY || 0);
+    if (pageX || pageY) showClickPointer(pageX, pageY);
+    sendResponse?.({ ok: true });
+    return true;
+  }
+  if (message?.type === "moonwalk_trigger_click_burst") {
+    triggerClickBurst();
+    sendResponse?.({ ok: true });
     return true;
   }
   return false;

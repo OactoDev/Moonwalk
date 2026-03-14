@@ -89,9 +89,10 @@ def test_parse_milestone_response_clarification():
 
 
 def test_tool_category_summary():
-    planner = TaskPlanner()
+    from tools import registry
+    planner = TaskPlanner(tool_registry=registry)
     summary = planner._get_tool_category_summary()
-    assert "Browser/Web" in summary
-    assert "find_and_act" in summary
-    assert "Google Workspace" in summary
+    assert "get_web_information" in summary
+    assert "open_url" in summary
+    assert "browser_snapshot" in summary
     assert "gdocs_create" in summary

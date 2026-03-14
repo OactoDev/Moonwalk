@@ -216,6 +216,81 @@ def test_remote_executor_cancellation():
     return True
 
 
+def test_remote_executor_propagates_await_reply_signal():
+    """Test RemoteExecutor does not swallow await-reply suspension control flow."""
+    print("\n=== Testing RemoteExecutor (await_reply propagation) ===")
+
+    class AwaitReplySignal(Exception):
+        def __init__(self):
+            super().__init__()
+            self.suspended_milestone_id = 1
+            self.await_payload = {"message": "Hello! How can I assist you today?"}
+            self.await_data = {"signature": '{"message":"Hello! How can I assist you today?"}'}
+
+    executor = RemoteExecutor(
+        agent_id="test_await_signal",
+        provider=None,
+        tool_declarations=[],
+    )
+
+    milestones = [Milestone(id=1, goal="Ask the user a question")]
+
+    async def execute_fn(milestone, deliverables):
+        raise AwaitReplySignal()
+
+    try:
+        asyncio.run(executor.execute(milestones=milestones, execute_fn=execute_fn))
+        raise AssertionError("AwaitReplySignal should have propagated")
+    except AwaitReplySignal as exc:
+        assert exc.suspended_milestone_id == 1
+        assert exc.await_payload["message"] == "Hello! How can I assist you today?"
+
+    print("  ✓ AwaitReplySignal propagated instead of being converted to failure")
+    print("  Result: PASSED")
+    return True
+
+
+def test_sub_agent_manager_propagates_parallel_await_reply_signal():
+    """Test SubAgentManager re-raises await-reply suspension from parallel tasks."""
+    print("\n=== Testing SubAgentManager (parallel await_reply propagation) ===")
+
+    class AwaitReplySignal(Exception):
+        def __init__(self, milestone_id: int):
+            super().__init__()
+            self.suspended_milestone_id = milestone_id
+            self.await_payload = {"message": f"Need input for milestone {milestone_id}"}
+            self.await_data = {"signature": f'm{milestone_id}'}
+
+    manager = SubAgentManager(
+        provider=None,
+        tool_declarations=[],
+    )
+
+    plan = MilestonePlan(
+        task_summary="Need user input",
+        milestones=[
+            Milestone(id=1, goal="Ask user about option A"),
+            Milestone(id=2, goal="Ask user about option B"),
+        ]
+    )
+
+    async def execute_fn(milestone, deliverables):
+        if milestone.id == 1:
+            raise AwaitReplySignal(milestone.id)
+        return True, f"done {milestone.id}"
+
+    try:
+        asyncio.run(manager.dispatch(plan, execute_fn=execute_fn))
+        raise AssertionError("AwaitReplySignal should have propagated from parallel dispatch")
+    except AwaitReplySignal as exc:
+        assert exc.suspended_milestone_id == 1
+        assert "Need input" in exc.await_payload["message"]
+
+    print("  ✓ Parallel await_reply suspension propagated out of SubAgentManager")
+    print("  Result: PASSED")
+    return True
+
+
 def test_sub_agent_manager_dispatch():
     """Test SubAgentManager dispatch in placeholder mode."""
     print("\n=== Testing SubAgentManager dispatch ===")
@@ -299,6 +374,8 @@ def main():
     results.append(("RemoteExecutor (placeholder)", test_remote_executor_placeholder()))
     results.append(("RemoteExecutor (unmet deps)", test_remote_executor_unmet_dependencies()))
     results.append(("RemoteExecutor (cancellation)", test_remote_executor_cancellation()))
+    results.append(("RemoteExecutor (await propagation)", test_remote_executor_propagates_await_reply_signal()))
+    results.append(("SubAgentManager (await propagation)", test_sub_agent_manager_propagates_parallel_await_reply_signal()))
     results.append(("SubAgentManager dispatch", test_sub_agent_manager_dispatch()))
     results.append(("SubAgentResult types", test_sub_agent_result_types()))
 

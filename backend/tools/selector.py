@@ -7,6 +7,7 @@ Reduces the 30+ tools down to a relevant subset for each request.
 
 import asyncio
 import contextvars
+import inspect
 import json
 import time
 from typing import Iterable, List, Set, Dict, Optional
@@ -16,13 +17,17 @@ from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 from agent.browser_intent_utils import is_browser_chrome_action
 from browser.interpreter_ai import (
     BrowserInterpretationError,
-    choose_search_result_with_flash,
-    decide_web_route_with_flash,
     summarize_scraped_page_with_flash,
 )
+from runtime_state import runtime_state_store
+from tools.contracts import dumps as contract_dumps
+from tools.contracts import error_envelope, success_envelope
+from tools.route_policy import decide_web_route as decide_web_route_with_flash
+from tools.search_policy import choose_search_result as choose_search_result_with_flash
 from tools.registry import registry
 from tools.registry import registry as tool_registry
 from tools.browser_tools import _lookup_snapshot
+from browser.store import browser_store
 
 print = partial(print, flush=True)
 
@@ -163,6 +168,12 @@ def set_tool_gateway_context(
     browser_session_id: str = "",
 ) -> None:
     """Store lightweight runtime context for gateway tools."""
+    runtime_state_store.update_os_state(
+        active_app=(active_app or "").strip(),
+        browser_url=(browser_url or "").strip(),
+        provenance="browser_bridge" if browser_bridge_connected or browser_has_snapshot else ("applescript_fallback" if browser_url else ""),
+        degraded=bool(browser_url) and not (browser_bridge_connected or browser_has_snapshot),
+    )
     _TOOL_GATEWAY_CONTEXT.set(
         {
             "active_app": (active_app or "").strip(),
@@ -176,9 +187,17 @@ def set_tool_gateway_context(
 
 
 def _gateway_error(message: str, **extra) -> str:
-    payload = {"ok": False, "message": message}
-    payload.update(extra)
-    return json.dumps(payload, ensure_ascii=False)
+    error_code = str(extra.pop("error_code", "") or "tool.unknown").strip()
+    session_id = str(extra.get("session_id", "") or "").strip()
+    payload = error_envelope(
+        error_code,
+        message,
+        session_id=session_id,
+        source="tool.get_web_information",
+        details=extra,
+        flatten_details=True,
+    )
+    return contract_dumps(payload)
 
 
 def _safe_json(raw: str) -> dict:
@@ -251,6 +270,15 @@ def _sync_live_browser_context(context: Optional[dict]) -> dict:
     live_context.setdefault("browser_bridge_connected", False)
     live_context.setdefault("browser_has_snapshot", False)
     live_context.setdefault("browser_session_id", "")
+    runtime_snapshot = runtime_state_store.snapshot()
+    browser_state = runtime_snapshot.browser_state
+    if browser_state.connected:
+        live_context["browser_bridge_connected"] = True
+    if browser_state.url:
+        live_context["browser_has_snapshot"] = True
+        live_context["browser_url"] = browser_state.url
+    if browser_state.session_id:
+        live_context["browser_session_id"] = browser_state.session_id
     try:
         from browser.bridge import browser_bridge
         from browser.store import browser_store
@@ -262,10 +290,8 @@ def _sync_live_browser_context(context: Optional[dict]) -> dict:
         live_context["browser_bridge_connected"] = True
     if snapshot is not None:
         live_context["browser_has_snapshot"] = True
-        live_context["browser_url"] = (
-            str(live_context.get("browser_url") or "").strip()
-            or str(getattr(snapshot, "url", "") or "").strip()
-        )
+        # Prioritize the live snapshot URL over any cached context URL
+        live_context["browser_url"] = str(getattr(snapshot, "url", "") or "").strip()
     session_id = (
         str(browser_bridge.connected_session_id() or "").strip()
         or str(getattr(snapshot, "session_id", "") or "").strip()
@@ -323,13 +349,12 @@ def _prefer_browser_route(target_type: str, explicit_url: str, context: dict) ->
     live_context = _sync_live_browser_context(context)
     if live_context.get("background_mode"):
         return False
-    active_app = _norm_text(live_context.get("active_app", ""))
-    browser_url = (live_context.get("browser_url") or "").strip()
-    if active_app in _BROWSER_APPS or browser_url or _has_live_browser_bridge(live_context):
+    browser_url = str(live_context.get("browser_url", "") or "").strip()
+    if explicit_url and browser_url and explicit_url.rstrip("/") == browser_url.rstrip("/"):
         return True
-    if explicit_url and _domain(explicit_url) in _SEARCH_RESULT_HOSTS:
-        return True
-    return target_type in {"page_content", "page_summary", "structured_data"} and bool(explicit_url)
+    if target_type == "search_results":
+        return False
+    return bool(browser_url and _has_live_browser_bridge(live_context))
 
 
 def _fallback_route_after_planner_error(target_type: str, explicit_url: str, context: dict) -> str:
@@ -680,16 +705,21 @@ async def get_web_information(
         )
     else:
         try:
-            route_plan = await decide_web_route_with_flash(
+            route_plan = decide_web_route_with_flash(
                 target_type=target_type,
                 query=query,
                 url=url,
                 item_hint=item_hint,
                 context=context,
+                runtime_state=runtime_state_store.snapshot().to_dict(),
             )
+            if inspect.isawaitable(route_plan):
+                route_plan = await route_plan
             route = str(route_plan.get("route", "")).strip() or "background_fetch"
             route_decision_reason = str(route_plan.get("reason", "")).strip()
-            route_decision_model = str(route_plan.get("_interpreter_model", "")).strip()
+            route_decision_model = str(
+                route_plan.get("policy", "") or route_plan.get("_interpreter_model", "") or ""
+            ).strip() or "deterministic-web-policy"
             try:
                 route_decision_confidence = max(0.0, min(float(route_plan.get("confidence", 0.0) or 0.0), 1.0))
             except Exception:
@@ -697,7 +727,7 @@ async def get_web_information(
             print(
                 f"[WebGateway] route={route} degraded_mode=false "
                 f"target_type={target_type} "
-                f"model={route_decision_model or 'flash'}"
+                f"model={route_decision_model}"
             )
         except BrowserInterpretationError as exc:
             route = _fallback_route_after_planner_error(target_type, url, context)
@@ -724,6 +754,15 @@ async def get_web_information(
         if route_decision_error_code:
             payload["route_decision_error_code"] = route_decision_error_code
         return payload
+
+    def _gateway_success(payload: dict, *, resolved_route: str) -> str:
+        applied = _apply_route_metadata(payload, resolved_route=resolved_route)
+        envelope = success_envelope(
+            applied,
+            session_id=str(applied.get("session_id", "") or context.get("browser_session_id", "") or ""),
+            provenance=resolved_route,
+        )
+        return contract_dumps(envelope)
 
     async def _background_search_payload(*, resolved_route: str = "background_fetch") -> str:
         if not query:
@@ -760,7 +799,7 @@ async def get_web_information(
             "links": data.get("links", [])[:max_items],
         }
         _clear_sticky_route(sticky_key)
-        return json.dumps(_apply_route_metadata(payload, resolved_route=resolved_route), ensure_ascii=False)
+        return _gateway_success(payload, resolved_route=resolved_route)
 
     async def _background_page_payload(
         *,
@@ -845,7 +884,7 @@ async def get_web_information(
         if follow_meta:
             payload.update({k: v for k, v in follow_meta.items() if v not in (None, "", [])})
         _clear_sticky_route(sticky_key)
-        return json.dumps(_apply_route_metadata(payload, resolved_route=resolved_route), ensure_ascii=False)
+        return _gateway_success(payload, resolved_route=resolved_route)
 
     async def _choose_search_result_item(
         items: list[dict],
@@ -859,35 +898,33 @@ async def get_web_information(
                 "search_follow_degraded": True,
                 "search_follow_reason": "No search result items were available to choose from.",
             }
-        try:
-            selection = await choose_search_result_with_flash(
-                query=query,
-                target_type=target_type,
-                items=items,
-                page_url=page_url,
-                page_title=page_title,
-            )
+        selection = choose_search_result_with_flash(
+            items=items,
+            query=query,
+            target_type=target_type,
+        )
+        if inspect.isawaitable(selection):
+            selection = await selection
+        if isinstance(selection, tuple) and len(selection) == 2:
+            chosen, follow_meta = selection
+            return chosen, follow_meta
+        if isinstance(selection, dict):
             chosen = _match_selected_search_item(items, selection)
             if chosen:
                 return chosen, {
-                    "search_follow_strategy": "flash_choice",
+                    "search_follow_strategy": "deterministic-ranking",
                     "search_follow_degraded": False,
                     "search_follow_reason": str(selection.get("reason", "") or "").strip(),
                     "search_follow_confidence": float(selection.get("confidence", 0.0) or 0.0),
-                    "search_follow_model": str(selection.get("_interpreter_model", "") or "").strip(),
+                    "search_follow_model": str(
+                        selection.get("policy", "") or selection.get("_interpreter_model", "") or "deterministic-search-policy"
+                    ).strip(),
                 }
-        except BrowserInterpretationError as exc:
-            return (items[0] if items else None), {
-                "search_follow_strategy": "degraded_first_result",
-                "search_follow_degraded": True,
-                "search_follow_reason": exc.reason,
-                "search_follow_error_code": exc.error_code,
-            }
-
         return (items[0] if items else None), {
-            "search_follow_strategy": "degraded_first_result",
+            "search_follow_strategy": "deterministic-first-result",
             "search_follow_degraded": True,
-            "search_follow_reason": "Flash chooser returned no matching result; using the first extracted result.",
+            "search_follow_reason": "No strong deterministic winner; using first result.",
+            "search_follow_confidence": 0.35,
         }
 
     async def _browser_open_if_needed(target_url: str) -> str:
@@ -941,6 +978,16 @@ async def get_web_information(
         target_session_id = ""
         while time.time() - started < 5.0:
             await asyncio.sleep(0.25)
+            # Check for a match in ANY known session snapshot
+            match_sid = ""
+            for sid, snap in getattr(browser_store, "_snapshots", {}).items():
+                if target_domain in str(getattr(snap, "url", "") or ""):
+                    match_sid = sid
+                    break
+            if match_sid:
+                target_session_id = match_sid
+                break
+            
             s_cand = _lookup_snapshot("")
             if s_cand and target_domain in str(s_cand.url or ""):
                 target_session_id = str(s_cand.session_id)
@@ -1010,7 +1057,7 @@ async def get_web_information(
                 data["search_strategy"] = "browser_live"
                 data["search_attempts"] = search_attempts
                 _clear_sticky_route(sticky_key)
-                return json.dumps(_apply_route_metadata(data, resolved_route=route), ensure_ascii=False)
+                return _gateway_success(data, resolved_route=route)
             else:
                 last_error = {
                     "message": "No structured search results matched on the current browser page.",
@@ -1046,6 +1093,48 @@ async def get_web_information(
         )
 
     async def _search_follow_then_read(*, resolved_route: str) -> str:
+        request_state = runtime_state_store.snapshot().request_state
+        cached_source_url = str(getattr(request_state, "selected_source_url", "") or "").strip()
+        cached_source_label = str(getattr(request_state, "selected_source_label", "") or "").strip()
+        if cached_source_url:
+            follow_meta = {
+                "selected_source_url": cached_source_url,
+                "selected_source_label": cached_source_label,
+                "search_follow_strategy": "request-state-reuse",
+                "search_follow_degraded": False,
+                "search_follow_reason": "Reused the previously selected source for this request.",
+                "search_follow_confidence": 0.95,
+                "search_follow_model": "request-state-cache",
+            }
+            if resolved_route == "browser_aci":
+                await _browser_open_if_needed(cached_source_url)
+                if target_type == "page_summary":
+                    raw = await tool_registry.execute("get_page_summary", {})
+                    data = _safe_json(raw)
+                elif target_type == "structured_data":
+                    raw = await tool_registry.execute(
+                        "extract_structured_data",
+                        {"item_type": item_hint, "query": query, "max_items": max_items},
+                    )
+                    data = _safe_json(raw)
+                else:
+                    raw = await tool_registry.execute(
+                        "read_page_content",
+                        {"max_chars": max_chars, "scroll_pages": 2},
+                    )
+                    data = _safe_json(raw)
+                if data.get("ok") is not False and data:
+                    data["ok"] = True
+                    data.update({k: v for k, v in follow_meta.items() if v not in (None, "", [])})
+                    _clear_sticky_route(sticky_key)
+                    return _gateway_success(data, resolved_route=resolved_route)
+            else:
+                return await _background_page_payload(
+                    target_url=cached_source_url,
+                    resolved_route=resolved_route,
+                    follow_meta=follow_meta,
+                )
+
         if resolved_route == "browser_aci":
             search_payload_raw = await _browser_search_results_payload()
         else:
@@ -1074,6 +1163,11 @@ async def get_web_information(
         follow_meta = dict(follow_meta or {})
         follow_meta["selected_source_url"] = chosen_url
         follow_meta["selected_source_label"] = chosen_label
+        runtime_state_store.update_request_state(
+            selected_source_url=chosen_url,
+            selected_source_label=chosen_label,
+            search_results=items,
+        )
         if not chosen_url:
             return _gateway_error(
                 "Selected search result has no URL to follow.",
@@ -1102,7 +1196,7 @@ async def get_web_information(
                     data["ok"] = True
                     data.update({k: v for k, v in follow_meta.items() if v not in (None, "", [])})
                     _clear_sticky_route(sticky_key)
-                    return json.dumps(_apply_route_metadata(data, resolved_route=resolved_route), ensure_ascii=False)
+                    return _gateway_success(data, resolved_route=resolved_route)
                 return _gateway_error(
                     "No page summary available after following the selected result.",
                     target_type=target_type,
@@ -1136,7 +1230,7 @@ async def get_web_information(
                             data["content_length"] = len(preview)
                     data.update({k: v for k, v in follow_meta.items() if v not in (None, "", [])})
                     _clear_sticky_route(sticky_key)
-                    return json.dumps(_apply_route_metadata(data, resolved_route=resolved_route), ensure_ascii=False)
+                    return _gateway_success(data, resolved_route=resolved_route)
                 return _gateway_error(
                     "No structured data extracted after following the selected result.",
                     target_type=target_type,
@@ -1163,7 +1257,7 @@ async def get_web_information(
                 data["ok"] = True
                 data.update({k: v for k, v in follow_meta.items() if v not in (None, "", [])})
                 _clear_sticky_route(sticky_key)
-                return json.dumps(_apply_route_metadata(data, resolved_route=resolved_route), ensure_ascii=False)
+                return _gateway_success(data, resolved_route=resolved_route)
             return _gateway_error(
                 "No page content available after following the selected result.",
                 target_type=target_type,
@@ -1202,7 +1296,7 @@ async def get_web_information(
             if data:
                 data["ok"] = True
                 _clear_sticky_route(sticky_key)
-                return json.dumps(_apply_route_metadata(data, resolved_route=route), ensure_ascii=False)
+                return _gateway_success(data, resolved_route=route)
             return _gateway_error("No page summary available", target_type=target_type, route=route)
 
         if target_type == "structured_data":
@@ -1230,7 +1324,7 @@ async def get_web_information(
                         data["content"] = preview
                         data["content_length"] = len(preview)
                 _clear_sticky_route(sticky_key)
-                return json.dumps(_apply_route_metadata(data, resolved_route=route), ensure_ascii=False)
+                return _gateway_success(data, resolved_route=route)
             if url:
                 _record_sticky_route(sticky_key, "background_fetch", "Browser structured extraction failed for explicit URL.")
                 return await _background_page_payload(target_url=url, resolved_route="background_fetch_fallback")
@@ -1254,7 +1348,7 @@ async def get_web_information(
         if content_length > 0:
             data["ok"] = True
             _clear_sticky_route(sticky_key)
-            return json.dumps(_apply_route_metadata(data, resolved_route=route), ensure_ascii=False)
+            return _gateway_success(data, resolved_route=route)
 
         if url:
             _record_sticky_route(sticky_key, "background_fetch", "Browser page read returned no readable content for explicit URL.")
@@ -1265,7 +1359,7 @@ async def get_web_information(
         if fb:
             fb["ok"] = True
             _clear_sticky_route(sticky_key)
-            return json.dumps(_apply_route_metadata(fb, resolved_route=route), ensure_ascii=False)
+            return _gateway_success(fb, resolved_route=route)
         return _gateway_error("No readable page content extracted", target_type="page_content", route=route)
 
     if target_type == "search_results":

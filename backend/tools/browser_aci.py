@@ -13,6 +13,7 @@ LLM tool list in future; the ACI tools compose them internally.
 
 import asyncio
 import json
+import re
 from typing import Optional, Any
 from urllib.parse import urlparse
 
@@ -21,11 +22,13 @@ from browser.interpreter_ai import (
     extract_structured_items_with_flash,
     summarize_page_with_flash,
 )
+from browser.listing_extractor import extract_property_listing_items
 from browser.selector_ai import select_browser_candidate_with_flash
 from tools.registry import registry
 
 # Re-use the low-level helpers from browser_tools
 from tools.browser_tools import (
+    _bridge_extract_readability,
     _require_snapshot,
     _resolve_element,
     _queue_browser_action,
@@ -280,6 +283,108 @@ def _coerce_confidence(value: Any) -> float:
         return 0.0
 
 
+def _clean_readability_text(text: str) -> str:
+    return "\n\n".join(
+        line.strip()
+        for line in re.split(r"\n{2,}", str(text or "").strip())
+        if line.strip()
+    ).strip()
+
+
+def _truncate_summary_text(text: str, max_chars: int = 320) -> str:
+    cleaned = " ".join(str(text or "").split()).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    cut = cleaned.rfind(" ", 0, max_chars - 3)
+    if cut < max_chars // 2:
+        cut = max_chars - 3
+    return cleaned[:cut].rstrip() + "..."
+
+
+def _summarize_readability_text(excerpt: str, text: str) -> str:
+    excerpt_text = " ".join(str(excerpt or "").split()).strip()
+    if excerpt_text:
+        return _truncate_summary_text(excerpt_text)
+
+    for paragraph in re.split(r"\n{2,}", str(text or "").strip()):
+        cleaned = " ".join(paragraph.split()).strip()
+        if len(cleaned) >= 60:
+            return _truncate_summary_text(cleaned)
+
+    return _truncate_summary_text(text)
+
+
+def _readability_confidence(content_length: int) -> float:
+    if content_length >= 1200:
+        return 0.94
+    if content_length >= 600:
+        return 0.9
+    return 0.82
+
+
+def _build_readability_page_summary(snapshot, readability_payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    content = _clean_readability_text(readability_payload.get("text", ""))
+    raw_content_length = int(readability_payload.get("content_length", 0) or len(content))
+    if len(content) < 200:
+        return None
+
+    title = str(readability_payload.get("title", "")).strip() or snapshot.title or ""
+    excerpt = str(readability_payload.get("excerpt", "")).strip()
+    summary_text = _summarize_readability_text(excerpt, content)
+    page_type = "article" if raw_content_length >= 600 else "content_page"
+    headings = [{"ref_id": "", "text": title[:140], "tag": "h1"}] if title else []
+    stats = _snapshot_stats(snapshot)
+    vp = snapshot.viewport
+    page_height = getattr(vp, "page_height", 0) or getattr(vp, "scroll_height", 0) or 0
+
+    summary_lines = [f"Page type: {page_type}"]
+    if summary_text:
+        summary_lines.append(summary_text)
+    if title:
+        summary_lines.append(title)
+
+    _queue_research_highlight(
+        snapshot,
+        session_id=snapshot.session_id,
+        tool_name="get_page_summary",
+        mode="text",
+        duration_ms=3500,
+        source_url=snapshot.url,
+        title=title or snapshot.title or "",
+        snippet=content,
+        item_count=len(headings),
+    )
+
+    return {
+        "url": snapshot.url,
+        "title": title or snapshot.title or "",
+        "page_type": page_type,
+        "summary": summary_text,
+        "headings": headings,
+        "key_targets": [],
+        "link_count": stats["link_count"],
+        "form_field_count": stats["form_field_count"],
+        "image_count": stats["image_count"],
+        "text_block_count": stats["text_block_count"],
+        "total_elements": len(snapshot.elements),
+        "scroll_y": vp.scroll_y,
+        "page_height": page_height,
+        "viewport_height": vp.height,
+        "at_bottom": (vp.scroll_y + vp.height) >= (page_height - 5) if page_height > 0 else False,
+        "generation": snapshot.generation,
+        "confidence": _readability_confidence(raw_content_length),
+        "interpreter_model": "readability-js",
+        "degraded_mode": False,
+        "degraded_reason": "",
+        "summary_strategy": "readability",
+        "content": content,
+        "content_length": raw_content_length,
+        "byline": str(readability_payload.get("byline", "")).strip(),
+        "site_name": str(readability_payload.get("site_name", "")).strip(),
+        "lang": str(readability_payload.get("lang", "")).strip(),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════
 #  ACI Tool: find_and_act
 # ═══════════════════════════════════════════════════════════════
@@ -483,7 +588,8 @@ async def find_and_act(
 @registry.register(
     name="get_page_summary",
     description=(
-        "Get a Flash-backed summary of the current browser page: page type, "
+        "Get a structured summary of the current browser page using a fast "
+        "readability-first extraction path with Flash fallback: page type, "
         "key headings, important targets, and scroll position. Use this to "
         "understand what kind of page you're looking at before deciding how "
         "to interact with it."
@@ -500,10 +606,17 @@ async def find_and_act(
     },
 )
 async def get_page_summary(session_id: str = "") -> str:
-    """Interpret the current page with Flash and return a structured summary."""
+    """Interpret the current page with Readability-first extraction and Flash fallback."""
     snapshot, error = await _require_snapshot(session_id)
     if not snapshot:
         return _error_payload(error, error_code="no_snapshot")
+
+    if not _is_search_results_page(snapshot.url):
+        readability_payload = await _bridge_extract_readability(session_id=session_id or snapshot.session_id)
+        if readability_payload.get("ok"):
+            readability_summary = _build_readability_page_summary(snapshot, readability_payload)
+            if readability_summary:
+                return json.dumps(readability_summary, ensure_ascii=False)
 
     try:
         interpreted = await summarize_page_with_flash(snapshot)
@@ -586,6 +699,12 @@ async def get_page_summary(session_id: str = "") -> str:
             "interpreter_model": interpreted.get("_interpreter_model", ""),
             "degraded_mode": False,
             "degraded_reason": "",
+            "summary_strategy": "flash_fallback",
+            "content": "",
+            "content_length": 0,
+            "byline": "",
+            "site_name": "",
+            "lang": "",
         },
         ensure_ascii=False,
     )
@@ -762,6 +881,66 @@ async def extract_structured_data(
         return _error_payload(error, error_code="no_snapshot")
 
     normalized_item_type = _normalize_structured_item_type(item_type)
+    deterministic_items: list[dict[str, Any]] = []
+    deterministic_meta: dict[str, Any] = {}
+    if normalized_item_type in {"products", "all"}:
+        deterministic_items, deterministic_meta = extract_property_listing_items(
+            snapshot,
+            query=query,
+            max_items=max_items,
+        )
+        if deterministic_items:
+            vp = snapshot.viewport
+            page_height = getattr(vp, "page_height", 0) or getattr(vp, "scroll_height", 0) or 0
+            preview_rows = []
+            for item in deterministic_items[:5]:
+                row = " | ".join(
+                    part for part in (
+                        str(item.get("price", "")).strip(),
+                        str(item.get("label", "")).strip(),
+                        str(item.get("context", "")).strip(),
+                    ) if part
+                )
+                if row:
+                    preview_rows.append(row)
+
+            _queue_research_highlight(
+                snapshot,
+                session_id=session_id or snapshot.session_id,
+                tool_name="extract_structured_data",
+                mode="results",
+                duration_ms=4000,
+                source_url=snapshot.url,
+                title=snapshot.title,
+                snippet="\n".join(preview_rows),
+                item_count=len(deterministic_items),
+            )
+
+            return json.dumps(
+                {
+                    "url": snapshot.url,
+                    "title": snapshot.title,
+                    "page_type": "listing_results",
+                    "item_type": normalized_item_type,
+                    "requested_item_type": item_type,
+                    "query": query,
+                    "items": deterministic_items,
+                    "item_count": len(deterministic_items),
+                    "total_elements": len(snapshot.elements),
+                    "scroll_y": vp.scroll_y,
+                    "page_height": page_height,
+                    "at_bottom": (vp.scroll_y + vp.height) >= (page_height - 5) if page_height > 0 else False,
+                    "generation": snapshot.generation,
+                    "notes": "Used deterministic property-card extraction before Flash.",
+                    "confidence": _coerce_confidence(deterministic_meta.get("confidence", 0.0)),
+                    "interpreter_model": "deterministic-property-cards",
+                    "extraction_strategy": deterministic_meta.get("extraction_strategy", "deterministic-property-cards"),
+                    "source_domain": deterministic_meta.get("source_domain", ""),
+                    "degraded_mode": False,
+                    "degraded_reason": "",
+                },
+                ensure_ascii=False,
+            )
     try:
         interpreted = await extract_structured_items_with_flash(
             snapshot,
@@ -777,14 +956,23 @@ async def extract_structured_data(
                 query=query,
                 max_items=max_items,
             )
+        elif deterministic_items:
+            fallback_items = deterministic_items
         if fallback_items:
             vp = snapshot.viewport
             page_height = getattr(vp, "page_height", 0) or getattr(vp, "scroll_height", 0) or 0
+            interpreter_model = "deterministic-search-resolver"
+            extraction_strategy = "deterministic-search-resolver"
+            source_domain = ""
+            if deterministic_items:
+                interpreter_model = "deterministic-property-cards"
+                extraction_strategy = deterministic_meta.get("extraction_strategy", "deterministic-property-cards")
+                source_domain = deterministic_meta.get("source_domain", "")
             return json.dumps(
                 {
                     "url": snapshot.url,
                     "title": snapshot.title,
-                    "page_type": "search_results",
+                    "page_type": "listing_results" if deterministic_items else "search_results",
                     "item_type": normalized_item_type,
                     "requested_item_type": item_type,
                     "query": query,
@@ -796,8 +984,10 @@ async def extract_structured_data(
                     "at_bottom": (vp.scroll_y + vp.height) >= (page_height - 5) if page_height > 0 else False,
                     "generation": snapshot.generation,
                     "notes": "Used deterministic search-result extraction after Flash extraction failed.",
-                    "confidence": 0.55,
-                    "interpreter_model": "deterministic-search-resolver",
+                    "confidence": deterministic_meta.get("confidence", 0.55) if deterministic_items else 0.55,
+                    "interpreter_model": interpreter_model,
+                    "extraction_strategy": extraction_strategy,
+                    "source_domain": source_domain,
                     "degraded_mode": True,
                     "degraded_reason": exc.reason,
                 },
@@ -912,6 +1102,8 @@ async def extract_structured_data(
             "notes": str(interpreted.get("notes", "")).strip(),
             "confidence": _coerce_confidence(interpreted.get("confidence", 0.0)),
             "interpreter_model": interpreted.get("_interpreter_model", ""),
+            "extraction_strategy": "flash_browser_interpreter",
+            "source_domain": _url_domain(snapshot.url),
             "degraded_mode": False,
             "degraded_reason": "",
         },

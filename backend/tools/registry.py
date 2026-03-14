@@ -14,6 +14,8 @@ import asyncio
 import subprocess
 from dataclasses import dataclass, field
 from typing import Callable, Any, Optional
+from tools.contracts import dumps as contract_dumps
+from tools.contracts import error_envelope
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -75,13 +77,25 @@ class ToolRegistry:
         """
         tool = self._tools.get(name)
         if not tool:
-            return f"Error: Unknown tool '{name}'"
+            return contract_dumps(error_envelope(
+                "tool.unknown",
+                f"Unknown tool '{name}'",
+                source="tool.registry",
+                details={"tool_name": name},
+                flatten_details=True,
+            ))
         try:
             clean_args = {k: v for k, v in args.items() if k != "reasoning"}
             result = await tool.func(**clean_args)
             return str(result)
         except Exception as e:
-            return f"Error executing {name}: {e}"
+            return contract_dumps(error_envelope(
+                "tool.execution_failed",
+                f"Error executing {name}: {e}",
+                source="tool.registry",
+                details={"tool_name": name, "exception_type": type(e).__name__},
+                flatten_details=True,
+            ))
 
     def declarations(self, exclude: Optional[set] = None) -> list[dict]:
         """Export tools in Gemini function_declarations format.

@@ -7,28 +7,44 @@ Agent-facing tools for stable, verified browser element access.
 import asyncio
 import json
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from browser.bridge import browser_bridge
 from browser.models import ActionRequest
 from browser.selector_ai import select_browser_candidate_with_flash
 from browser.store import browser_store
 from browser.verifier import verify_action_result
+from runtime_state import runtime_state_store
+from tools.contracts import dumps as contract_dumps
+from tools.contracts import error_envelope
 from tools.registry import registry
 
 
 def _error_payload(message: str, **context) -> str:
-    payload = {"ok": False, "message": message}
-    payload.update(context)
-    return json.dumps(payload, ensure_ascii=False)
+    error_code = str(context.pop("error_code", "") or "browser.unknown").strip()
+    session_id = str(context.get("session_id", "") or "").strip()
+    payload = error_envelope(
+        error_code,
+        message,
+        session_id=session_id,
+        source="tool.browser",
+        details=context,
+        flatten_details=True,
+    )
+    return contract_dumps(payload)
 
 
 def _lookup_snapshot(session_id: str = ""):
     snapshot = browser_store.get_snapshot(session_id or None)
     if snapshot:
         return snapshot
-    if session_id:
-        return browser_store.get_snapshot(None)
+    
+    # If session_id is missing or not found, try to return the most recent snapshot
+    # across ALL sessions. This handles background tab activity better than a hard None.
+    global_snap = browser_store.get_snapshot(None)
+    if global_snap:
+        return global_snap
+        
     return None
 
 
@@ -152,6 +168,84 @@ def _queue_research_highlight(
         browser_bridge.queue_action(highlight_request)
     except Exception:
         pass
+
+
+async def _bridge_extract_readability(session_id: str = "", timeout: float = 4.0) -> dict[str, Any]:
+    if not browser_bridge.is_connected():
+        return {
+            "ok": False,
+            "message": "Browser extension bridge is not connected.",
+            "error": "bridge_disconnected",
+        }
+
+    snapshot = _lookup_snapshot(session_id)
+    resolved_session_id = session_id or (snapshot.session_id if snapshot else "") or (browser_bridge.connected_session_id() or "")
+    if not resolved_session_id:
+        return {
+            "ok": False,
+            "message": "No browser session is available for Readability extraction.",
+            "error": "missing_session",
+        }
+
+    request = ActionRequest(
+        action="extract_readability",
+        ref_id="",
+        session_id=resolved_session_id,
+        timeout=timeout,
+    )
+    queued = browser_bridge.queue_action(request)
+    if not queued.ok:
+        return {
+            "ok": False,
+            "message": queued.message,
+            "error": "queue_failed",
+        }
+
+    started = time.time()
+    while time.time() - started < timeout:
+        result = browser_bridge.latest_action_result(queued.action_id)
+        if result:
+            if not result.ok:
+                return {
+                    "ok": False,
+                    "message": result.message,
+                    "error": result.details.get("error", "action_failed"),
+                }
+            raw_payload = result.details.get("result", "")
+            if not raw_payload:
+                return {
+                    "ok": False,
+                    "message": "Readability extraction returned no payload.",
+                    "error": "empty_payload",
+                }
+            try:
+                payload = json.loads(raw_payload)
+            except (TypeError, ValueError):
+                return {
+                    "ok": False,
+                    "message": "Readability extraction returned invalid JSON.",
+                    "error": "invalid_payload",
+                }
+            if not isinstance(payload, dict):
+                return {
+                    "ok": False,
+                    "message": "Readability extraction returned an unexpected payload.",
+                    "error": "invalid_payload",
+                }
+            if "content_length" in payload:
+                try:
+                    payload["content_length"] = int(payload.get("content_length", 0) or 0)
+                except Exception:
+                    payload["content_length"] = 0
+            runtime_state_store.record_readability_extraction(payload)
+            return payload
+        await asyncio.sleep(0.1)
+
+    return {
+        "ok": False,
+        "message": "Timed out waiting for Readability extraction.",
+        "error": "timeout",
+    }
 
 
 @registry.register(
@@ -649,15 +743,71 @@ async def _queue_browser_action(action: str, ref_id: str, session_id: str = "", 
         timeout=timeout,
     )
     result = browser_bridge.queue_action(request)
-    report = verify_action_result(result)
+    if not result.ok:
+        report = verify_action_result(result)
+        return json.dumps({
+            "ok": False,
+            "action": result.action,
+            "ref_id": result.ref_id,
+            "action_id": result.action_id,
+            "message": result.message,
+            "pre_generation": result.pre_generation,
+            "post_generation": result.post_generation,
+            "verification": {
+                "success": report.success,
+                "confidence": report.confidence,
+                "checks_passed": report.checks_passed,
+                "needs_replan": report.needs_replan,
+            }
+        }, ensure_ascii=False)
+
+    # Wait for the action result and fresh snapshot
+    started = time.time()
+    action_timeout_s = timeout
+    action_result = None
+    
+    while time.time() - started < action_timeout_s:
+        action_result = browser_bridge.latest_action_result(result.action_id)
+        if action_result:
+            break
+        await asyncio.sleep(0.1)
+        
+    if not action_result:
+        # Timeout waiting for action execution
+        report = verify_action_result(result)
+        return json.dumps({
+            "ok": True, # Queue was ok, but execution timed out
+            "action": result.action,
+            "ref_id": result.ref_id,
+            "action_id": result.action_id,
+            "message": "Action queued but execution timed out. Snapshot may still be updating.",
+            "pre_generation": result.pre_generation,
+            "post_generation": result.post_generation,
+            "verification": {
+                "success": report.success,
+                "confidence": report.confidence,
+                "checks_passed": report.checks_passed,
+                "needs_replan": report.needs_replan,
+            }
+        }, ensure_ascii=False)
+
+    # Wait briefly for a fresh snapshot after successful action
+    if action_result.ok:
+        await asyncio.sleep(0.2)
+        fresh_snapshot = browser_store.get_snapshot(resolved_session_id)
+        post_gen = fresh_snapshot.generation if fresh_snapshot else action_result.post_generation
+    else:
+        post_gen = action_result.post_generation
+
+    report = verify_action_result(action_result)
     payload = {
-        "ok": result.ok,
-        "action": result.action,
-        "ref_id": result.ref_id,
-        "action_id": result.action_id,
-        "message": result.message,
-        "pre_generation": result.pre_generation,
-        "post_generation": result.post_generation,
+        "ok": action_result.ok,
+        "action": action_result.action,
+        "ref_id": action_result.ref_id,
+        "action_id": action_result.action_id,
+        "message": action_result.message,
+        "pre_generation": action_result.pre_generation,
+        "post_generation": post_gen,
         "verification": {
             "success": report.success,
             "confidence": report.confidence,
