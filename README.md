@@ -7,7 +7,7 @@ Built with Electron + Python. Thinks with LLMs. Acts through Accessibility APIs 
 ---
 
 <p align="center">
-  <img src="docs/screenshots/pill-idle.svg" alt="Idle State" width="480"/>
+  <img src="docs/screenshots/moonwalk.png" alt="Idle State" width="480"/>
 </p>
 
 ## ✨ Features
