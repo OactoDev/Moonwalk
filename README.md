@@ -60,69 +60,18 @@ The glass pill morphs between four states:
 
 ## 🏗 Architecture
 
-```
-┌───────────────────────────────────────────────────────┐
-│                    macOS Desktop                       │
-│                                                        │
-│  ┌────────────────────┐      ┌─────────────────────┐  │
-│  │   Electron 36.2    │ WS   │   Python Backend    │  │
-│  │                    │─────▶│   FastAPI :8000      │  │
-│  │  • Transparent     │      │                     │  │
-│  │    frameless window│◀─────│  • SPAV Agent       │  │
-│  │  • Glass-pill UI   │ JSON │  • Milestone exec   │  │
-│  │  • Audio capture   │      │  • Perception       │  │
-│  │  • Ghost mouse     │      │  • Tool registry    │  │
-│  │  • Global hotkeys  │      │  • Accessibility    │  │
-│  └────────────────────┘      └──────────┬──────────┘  │
-│           │                             │              │
-│      ⌘⇧Space / ⌥Space          osascript / AX API    │
-│      Voice / Text               open_app, click,      │
-│                                 type, scroll, read     │
-└───────────────────────────────────────────────────────┘
-                        │
-                   Cloud Mode
-                        │
-┌───────────────────────────────────────────────────────┐
-│              Google Cloud Platform                     │
-│                                                        │
-│  ┌──────────────────┐   ┌──────────┐  ┌────────────┐ │
-│  │   Cloud Run      │───│   GCS    │  │  Firestore  │ │
-│  │   :8080          │   │  (files) │  │  (memory)   │ │
-│  │                  │   └──────────┘  └────────────┘ │
-│  │  • Auth (GCP ID  │                                 │
-│  │    + shared key) │   ┌──────────────────────────┐ │
-│  │  • Per-user      │   │  Chrome Extension        │ │
-│  │    agent pool    │───│  MV3 · content script    │ │
-│  │  • Auto-eviction │   │  • Search/extract        │ │
-│  └──────────────────┘   │  • Form fill             │ │
-│                          │  • Page interaction      │ │
-│                          └──────────────────────────┘ │
-└───────────────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="docs/screenshots/architecture.svg" alt="Moonwalk Architecture" width="800"/>
+</p>
 
 ### Agent Loop (SPAV)
 
-```
-       ┌──────────┐
-       │  SENSE   │  Screen capture + accessibility tree + glance
-       └────┬─────┘
-            │
-       ┌────▼─────┐
-       │   PLAN   │  LLM decomposes goal → milestones → steps
-       └────┬─────┘
-            │
-       ┌────▼─────┐
-       │   ACT    │  Execute tool calls (click, type, open_app…)
-       └────┬─────┘
-            │
-       ┌────▼─────┐
-       │  VERIFY  │  Screenshot diff + LLM confirms success
-       └────┬─────┘
-            │
-       ┌────▼─────┐
-       │ REPLAN?  │──▶ If failed, retry or adjust plan
-       └──────────┘
-```
+<p align="center">
+  <img src="docs/screenshots/spav-loop.svg" alt="SPAV Agent Loop" width="600"/>
+</p>
+
+> 🎬 **[Open the interactive "How It Works" presentation →](docs/how-it-works.html)**
+> <br><sub>Cinematic walkthrough with animated glassmorphic flowcharts. Open in a browser — keyboard / click to navigate, or let it auto-play for screen recording.</sub>
 
 ---
 

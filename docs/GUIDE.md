@@ -239,35 +239,10 @@ The extension now routes browser actions through the cloud brain.
 
 ## Architecture Reference
 
-```
-┌──────────────────────────────────────────────┐
-│              macOS Desktop                    │
-│  ┌─────────────┐     ┌──────────────────┐    │
-│  │  Electron    │────▶│  Python Backend  │    │
-│  │  Overlay     │ WS  │  :8000           │    │
-│  │  (glass pill)│◀────│  (SPAV Agent)    │    │
-│  └─────────────┘     └──────────────────┘    │
-│         │                    │                │
-│    ⌘⇧Space / ⌥Space    Accessibility API     │
-│    Voice / Text         AppleScript / osascript│
-└──────────────────────────────────────────────┘
-          │
-     Cloud Mode
-          │
-┌──────────────────────────────────────────────┐
-│           Google Cloud Platform               │
-│  ┌──────────────┐  ┌───────┐  ┌──────────┐  │
-│  │  Cloud Run   │──│  GCS  │  │ Firestore │  │
-│  │  :8080       │  │ files │  │ memory    │  │
-│  └──────┬───────┘  └───────┘  └──────────┘  │
-│         │                                     │
-│  ┌──────┴───────┐                            │
-│  │ Chrome Ext   │                            │
-│  │ (bridge)     │                            │
-│  └──────────────┘                            │
-└──────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="screenshots/architecture.svg" alt="Moonwalk Architecture" width="800"/>
+</p>
 
 ---
 
-*Last updated: $(date +%Y-%m-%d)*
+*Last updated: 2026-03-15*
