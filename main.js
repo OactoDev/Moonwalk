@@ -1,6 +1,7 @@
 const path = require("node:path");
 const fs = require("node:fs");
 const net = require("node:net");
+const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const {
   app,
@@ -9,7 +10,8 @@ const {
   ipcMain,
   screen,
   session,
-  systemPreferences
+  systemPreferences,
+  safeStorage,
 } = require("electron");
 
 const HOTKEYS = (process.env.LIQUID_HOTKEY || "CommandOrControl+Shift+Space,Alt+Space")
@@ -18,6 +20,15 @@ const HOTKEYS = (process.env.LIQUID_HOTKEY || "CommandOrControl+Shift+Space,Alt+
   .filter(Boolean);
 
 const WINDOW_LEVEL = "screen-saver";
+
+// ── Path resolution (dev vs packaged) ──
+const IS_PACKAGED = app.isPackaged;
+const APP_ROOT = IS_PACKAGED
+  ? path.join(process.resourcesPath)
+  : __dirname;
+const BACKEND_ROOT = IS_PACKAGED
+  ? path.join(APP_ROOT, "backend")
+  : path.join(__dirname, "backend");
 
 let mainWindow;
 let lastWakeAt = 0;
@@ -29,6 +40,9 @@ const BACKEND_HOST = process.env.MOONWALK_BACKEND_HOST || "127.0.0.1";
 const BACKEND_PORT = Number(process.env.MOONWALK_BACKEND_PORT || "8000");
 const BRIDGE_PORT = Number(process.env.MOONWALK_BROWSER_BRIDGE_PORT || "8765");
 const BACKEND_READY_SENTINEL = "[Backend] READY";
+
+// ── Credential storage ──
+const CRED_FILE = path.join(app.getPath("userData"), "credentials.enc");
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -66,12 +80,16 @@ async function canReachBackend(timeoutMs = 1500) {
 }
 
 async function startPythonBackend() {
-  const venvPythonPath = path.join(__dirname, "venv", "bin", "python3");
-  const scriptPath = path.join(__dirname, "backend", "servers", "local_server.py");
+  // In packaged mode, venv lives next to the app; in dev mode, in project root
+  const venvPythonPath = IS_PACKAGED
+    ? path.join(APP_ROOT, "venv", "bin", "python3")
+    : path.join(__dirname, "venv", "bin", "python3");
+  const scriptPath = path.join(BACKEND_ROOT, "servers", "local_server.py");
+  const cwd = IS_PACKAGED ? APP_ROOT : __dirname;
 
   if (!fs.existsSync(venvPythonPath)) {
     console.error(`[Backend] Python executable not found at: ${venvPythonPath}`);
-    console.error("[Backend] Please ensure you have run: python3 -m venv venv");
+    console.error("[Backend] Please run: ./setup.sh");
     return false;
   }
 
@@ -85,7 +103,7 @@ async function startPythonBackend() {
 
   // Start the python process
   pythonProcess = spawn(venvPythonPath, [scriptPath], {
-    cwd: __dirname,
+    cwd: cwd,
     stdio: ['ignore', 'pipe', 'pipe']
   });
   ownsPythonProcess = true;
@@ -316,6 +334,75 @@ ipcMain.on("log-error", (event, msg) => {
 
 ipcMain.on("log-info", (event, msg) => {
   console.log(`[Renderer Info] ${msg}`);
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  Credential Storage (safeStorage-encrypted)
+// ═══════════════════════════════════════════════════════════════
+
+function loadCredentials() {
+  try {
+    if (!fs.existsSync(CRED_FILE)) return null;
+    const encrypted = fs.readFileSync(CRED_FILE);
+    if (!safeStorage.isEncryptionAvailable()) {
+      console.warn("[Auth] safeStorage encryption not available");
+      return null;
+    }
+    const decrypted = safeStorage.decryptString(encrypted);
+    return JSON.parse(decrypted);
+  } catch (err) {
+    console.error("[Auth] Failed to load credentials:", err.message);
+    return null;
+  }
+}
+
+function saveCredentials(creds) {
+  try {
+    if (!safeStorage.isEncryptionAvailable()) {
+      console.warn("[Auth] safeStorage encryption not available");
+      return false;
+    }
+    const encrypted = safeStorage.encryptString(JSON.stringify(creds));
+    fs.writeFileSync(CRED_FILE, encrypted);
+    return true;
+  } catch (err) {
+    console.error("[Auth] Failed to save credentials:", err.message);
+    return false;
+  }
+}
+
+ipcMain.handle("auth:load-credentials", () => {
+  return loadCredentials();
+});
+
+ipcMain.handle("auth:save-credentials", (event, creds) => {
+  return saveCredentials(creds);
+});
+
+ipcMain.handle("auth:generate-user-id", () => {
+  return {
+    user_id: crypto.randomUUID(),
+    auth_token: crypto.randomBytes(36).toString("base64url"),
+  };
+});
+
+ipcMain.handle("auth:clear-credentials", () => {
+  try {
+    if (fs.existsSync(CRED_FILE)) fs.unlinkSync(CRED_FILE);
+    return true;
+  } catch { return false; }
+});
+
+ipcMain.handle("auth:is-first-launch", () => {
+  return !fs.existsSync(CRED_FILE);
+});
+
+ipcMain.handle("app:get-version", () => {
+  return app.getVersion();
+});
+
+ipcMain.handle("app:is-packaged", () => {
+  return IS_PACKAGED;
 });
 
 app.on("will-quit", () => {

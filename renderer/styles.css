@@ -9,6 +9,11 @@
   --green: #34c759;
   --yellow: #ffcc00;
   --red: #ff3b30;
+
+  /* AI analysis palette */
+  --ai-blue:   #007aff;
+  --ai-purple: #af52de;
+  --ai-peach:  #ff2d55;
 }
 
 * {
@@ -194,10 +199,8 @@ body {
   height: 280px;
 
   background:
-    radial-gradient(circle at 10% 10%, rgba(255, 150, 100, 0.45) 0%, transparent 60%),
-    radial-gradient(circle at 90% 10%, rgba(100, 200, 255, 0.45) 0%, transparent 60%),
-    radial-gradient(circle at 50% 90%, rgba(200, 100, 255, 0.35) 0%, transparent 60%),
-    radial-gradient(circle at 50% 50%, rgba(100, 255, 180, 0.3) 0%, transparent 60%);
+    radial-gradient(circle at 80% 0%, rgba(0, 122, 255, 0.08) 0%, transparent 50%),
+    radial-gradient(circle at 0% 50%, rgba(175, 82, 222, 0.06) 0%, transparent 50%);
 
   filter: blur(40px);
   z-index: 1;
@@ -269,51 +272,7 @@ body {
   }
 }
 
-/* ── Status Variants (colored spinner + subtle pill tint) ── */
-.variant-browsing .spinner {
-  border-color: rgba(175, 82, 222, 0.2);
-  border-top-color: #af52de;
-}
-
-.variant-typing .spinner {
-  border-color: rgba(52, 199, 89, 0.2);
-  border-top-color: #34c759;
-}
-
-.variant-searching .spinner {
-  border-color: rgba(255, 149, 0, 0.2);
-  border-top-color: #ff9500;
-}
-
-.variant-executing .spinner {
-  border-color: rgba(255, 59, 48, 0.2);
-  border-top-color: #ff3b30;
-}
-
-.variant-planning .spinner {
-  border-color: rgba(90, 200, 250, 0.2);
-  border-top-color: #5ac8fa;
-}
-
-.variant-browsing .status-text {
-  color: #af52de;
-}
-
-.variant-typing .status-text {
-  color: #34c759;
-}
-
-.variant-searching .status-text {
-  color: #ff9500;
-}
-
-.variant-executing .status-text {
-  color: #ff3b30;
-}
-
-.variant-planning .status-text {
-  color: #5ac8fa;
-}
+/* ── Status Variants ── */
 
 /* ── Dynamic App Icon ── */
 .app-icon {
@@ -687,12 +646,11 @@ body {
   -webkit-backdrop-filter: blur(24px) saturate(180%);
 
   box-shadow:
-    0 20px 40px -8px rgba(0, 0, 0, 0.12),
-    0 8px 16px -4px rgba(0, 0, 0, 0.06),
+    0 20px 40px -8px rgba(0, 0, 0, 0.08),
     inset 0 1px 1px rgba(255, 255, 255, 0.9),
     inset 0 -1px 1px rgba(0, 0, 0, 0.02);
 
-  border: 1px solid rgba(0, 0, 0, 0.08);
+  border: 1px solid rgba(0, 0, 0, 0.04);
 
   animation: modal-appear 0.5s cubic-bezier(0.25, 1, 0.5, 1) backwards;
   transform-origin: top center;
@@ -1420,12 +1378,11 @@ body {
 }
 
 .modal-confirm-btn {
-  padding: 10px 24px;
-  border-radius: 12px;
-  /* iOS standard button radius */
-  border: none;
-  font-size: 15px;
-  font-weight: 500;
+  padding: 10px 20px;
+  border-radius: 99px;
+  border: 1px solid rgba(0, 0, 0, 0.04);
+  font-size: 14px;
+  font-weight: 600;
   cursor: pointer;
   transition: all 0.2s ease;
 }
@@ -1433,21 +1390,43 @@ body {
 .modal-confirm-btn.primary {
   background: #007aff;
   color: #fff;
-  box-shadow: 0 2px 8px rgba(0, 122, 255, 0.3);
+  box-shadow:
+    0 4px 12px -4px rgba(0, 122, 255, 0.4),
+    inset 0 1px 1px rgba(255, 255, 255, 0.4),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.15);
 }
 
 .modal-confirm-btn.primary:hover {
   background: #0066d6;
-  box-shadow: 0 4px 12px rgba(0, 122, 255, 0.4);
+  transform: translateY(-1px);
+  box-shadow:
+    0 6px 16px -4px rgba(0, 122, 255, 0.5),
+    inset 0 1px 1px rgba(255, 255, 255, 0.5),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.15);
+}
+
+.modal-confirm-btn.primary:active {
+  transform: translateY(1px);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.2);
 }
 
 .modal-confirm-btn.secondary {
-  background: rgba(0, 0, 0, 0.06);
+  background: rgba(255, 255, 255, 0.5);
   color: #1d1d1f;
+  box-shadow:
+    0 4px 12px -4px rgba(0, 0, 0, 0.1),
+    inset 0 1px 1px rgba(255, 255, 255, 0.9),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.05);
 }
 
 .modal-confirm-btn.secondary:hover {
-  background: rgba(0, 0, 0, 0.1);
+  background: rgba(255, 255, 255, 0.8);
+  transform: translateY(-1px);
+}
+
+.modal-confirm-btn.secondary:active {
+  transform: translateY(1px);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.05);
 }
 
 
@@ -1753,19 +1732,15 @@ body {
 }
 
 /* ══════════════════════════════════════════
-   UPGRADED PROCEED BUTTON (AI Style)
+   PROCEED BUTTON
    ══════════════════════════════════════════ */
 .modal-steps-btn-start {
   width: 100%;
   padding: 14px 24px;
-  border-radius: 16px;
-  /* Modern squircle radius */
-  border: none;
-
-  /* Vibrant AI Gradient */
-  background: linear-gradient(135deg, #007aff 0%, #af52de 100%);
+  border-radius: 99px;
+  border: 1px solid rgba(0, 0, 0, 0.04);
+  background: #007aff;
   color: #ffffff;
-
   font-size: 15px;
   font-weight: 600;
   cursor: pointer;
@@ -1774,41 +1749,225 @@ body {
   justify-content: center;
   gap: 8px;
   letter-spacing: -0.01em;
-
-  /* Layered shadow for floating effect and inner glow */
   box-shadow:
-    0 8px 24px -6px rgba(175, 82, 222, 0.4),
+    0 8px 20px -6px rgba(0, 122, 255, 0.4),
     inset 0 1px 1px rgba(255, 255, 255, 0.4),
-    inset 0 -2px 4px rgba(0, 0, 0, 0.1);
-
-  transition: all 0.3s cubic-bezier(0.32, 0.72, 0, 1);
+    inset 0 -1px 1px rgba(0, 0, 0, 0.15);
+  transition: all 0.2s cubic-bezier(0.25, 1, 0.5, 1);
 }
 
 .modal-steps-btn-start:hover {
-  transform: translateY(-2px);
+  transform: translateY(-1px);
+  background: #0066d6;
   box-shadow:
-    0 12px 32px -6px rgba(175, 82, 222, 0.5),
+    0 12px 24px -6px rgba(0, 122, 255, 0.5),
     inset 0 1px 1px rgba(255, 255, 255, 0.5),
-    inset 0 -2px 4px rgba(0, 0, 0, 0.1);
-  background: linear-gradient(135deg, #198cff 0%, #ba67e3 100%);
-  /* Slightly brighter on hover */
+    inset 0 -1px 1px rgba(0, 0, 0, 0.15);
 }
 
 .modal-steps-btn-start:active {
   transform: translateY(1px);
   box-shadow:
-    0 4px 12px -4px rgba(175, 82, 222, 0.3),
-    inset 0 2px 4px rgba(0, 0, 0, 0.15);
+    0 4px 12px -4px rgba(0, 122, 255, 0.3),
+    inset 0 2px 4px rgba(0, 0, 0, 0.2);
 }
 
 .modal-steps-btn-start svg {
   opacity: 0.9;
-  transition: transform 0.25s cubic-bezier(0.32, 0.72, 0, 1);
+  transition: transform 0.2s ease;
   width: 16px;
   height: 16px;
 }
 
 .modal-steps-btn-start:hover svg {
   transform: translateX(4px);
-  /* Pushes the arrow further on hover */
 }
+
+
+
+/* ══════════════════════════════════════════
+   AI ANALYSIS MODE — Subtle State Indicators
+   ══════════════════════════════════════════ */
+
+/* Ambient glow subtly brightens during DOING / LOADING */
+.ambient-glow.analyzing {
+  opacity: 1;
+  transform: scale(1.05);
+}
+
+/* Pill: subtle blue ring during DOING state — no animation */
+.glass-pill.state-doing {
+  border-color: rgba(0, 122, 255, 0.2);
+  box-shadow:
+    0 12px 32px -8px rgba(0, 0, 0, 0.1),
+    inset 0 1px 1px rgba(255, 255, 255, 0.9),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.05);
+}
+
+
+/* ══════════════════════════════════════════
+   ONBOARDING MODAL — First-launch setup
+   ══════════════════════════════════════════ */
+
+.onboarding-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  z-index: 9999;
+  animation: onboard-fade-in 0.4s ease;
+}
+
+.onboarding-overlay.hidden {
+  display: none;
+}
+
+@keyframes onboard-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.onboarding-card {
+  width: 380px;
+  background: rgba(28, 28, 30, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 18px;
+  padding: 32px 28px 24px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.5);
+  text-align: center;
+}
+
+.onboarding-header {
+  margin-bottom: 20px;
+}
+
+.onboarding-logo {
+  margin-bottom: 12px;
+}
+
+.onboarding-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: #f5f5f7;
+  margin: 0;
+}
+
+.onboarding-subtitle {
+  font-size: 13px;
+  color: #86868b;
+  margin: 4px 0 0;
+}
+
+.onboarding-step {
+  display: none;
+}
+
+.onboarding-step.active {
+  display: block;
+  animation: onboard-slide-in 0.3s ease;
+}
+
+@keyframes onboard-slide-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.onboarding-body {
+  text-align: left;
+  margin-bottom: 20px;
+}
+
+.onboarding-body p {
+  font-size: 13px;
+  color: #c8c8cc;
+  line-height: 1.5;
+  margin-bottom: 16px;
+}
+
+.onboarding-checklist {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.check-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: #e5e5ea;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 10px;
+}
+
+.check-item .check-icon {
+  font-size: 16px;
+  width: 20px;
+  text-align: center;
+}
+
+.check-item.ok .check-icon { color: #34c759; }
+.check-item.fail .check-icon { color: #ff3b30; }
+
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.shortcut-row kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 8px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro", sans-serif;
+  font-size: 13px;
+  color: #e5e5ea;
+}
+
+.shortcut-label {
+  font-size: 13px;
+  color: #86868b;
+  margin-left: 8px;
+}
+
+.onboarding-hint {
+  font-size: 12px !important;
+  color: #86868b !important;
+  margin-top: 16px !important;
+}
+
+.onboarding-btn {
+  width: 100%;
+  padding: 12px 20px;
+  border: none;
+  border-radius: 12px;
+  background: #007aff;
+  color: white;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.onboarding-btn:hover {
+  background: #0066d6;
+}
+
+.onboarding-version {
+  margin-top: 16px;
+  font-size: 11px;
+  color: #48484a;
+}
+

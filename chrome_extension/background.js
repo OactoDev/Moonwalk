@@ -4,13 +4,18 @@
 //  polling, snapshot forwarding, and keepalive pings.
 // ═══════════════════════════════════════════════════════════════
 
-const BRIDGE_URL = "ws://127.0.0.1:8765";
-const BRIDGE_TOKEN = "dev-bridge-token";
+// Defaults — overridden by chrome.storage.sync settings
+const DEFAULT_BRIDGE_URL = "ws://127.0.0.1:8765";
+const DEFAULT_BRIDGE_TOKEN = "dev-bridge-token";
 const EXTENSION_NAME = "moonwalk-browser-bridge";
 
-const ACTION_POLL_INTERVAL_MS = 300;   // ← was 1000 ms
+const ACTION_POLL_INTERVAL_MS = 5000;  // Fallback only — actions pushed via WebSocket
 const KEEPALIVE_INTERVAL_MS = 15000;   // ping every 15 s
 const RECONNECT_DELAY_MS = 1500;
+
+// Mutable config (loaded from chrome.storage.sync)
+let BRIDGE_URL = DEFAULT_BRIDGE_URL;
+let BRIDGE_TOKEN = DEFAULT_BRIDGE_TOKEN;
 
 let bridgeSocket = null;
 let authenticated = false;
@@ -22,6 +27,19 @@ let lastBridgeMessage = "Not connected yet";
 let actionPollTimer = null;
 let keepaliveTimer = null;
 let actionExecutionInFlight = false;
+
+// ── Load Settings ──
+
+async function loadSettings() {
+  try {
+    const result = await chrome.storage.sync.get(["bridgeUrl", "bridgeToken"]);
+    BRIDGE_URL = result.bridgeUrl || DEFAULT_BRIDGE_URL;
+    BRIDGE_TOKEN = result.bridgeToken || DEFAULT_BRIDGE_TOKEN;
+    log(`Settings loaded: url=${BRIDGE_URL}`);
+  } catch (e) {
+    log("Failed to load settings, using defaults:", e);
+  }
+}
 
 // ── Utility ──
 
@@ -180,24 +198,34 @@ async function executeActionOnTab(action) {
       );
     }
 
-    // ── Evaluate JS action: securely evaluate JS directly on the page ──
-    if (action?.action === "evaluate_js") {
-      const evalResult = await chrome.tabs.sendMessage(tab.id, {
-        type: "moonwalk_evaluate_js",
-        script: action?.text || "",
-        sessionId: action?.session_id || sessionId,
-        tabId: String(tab.id),
+    // ── Scanning mode: page-wide AI reading/analysis visual ──
+    if (action?.action === "scanning_start") {
+      const scanResult = await chrome.tabs.sendMessage(tab.id, {
+        type: "moonwalk_scanning_start",
+        label: metadata.label || "AI analyzing page…",
+        duration: Number(metadata.duration || 4000),
       });
       return buildActionResult(
         action,
-        !!evalResult?.ok,
-        evalResult?.ok ? "JS evaluation successful." : "JS evaluation failed.",
+        !!scanResult?.ok,
+        scanResult?.ok
+          ? `Scanning started, highlighted ${scanResult.highlighted || 0} elements.`
+          : "Scanning start failed.",
         metadata,
-        {
-          tab_id: String(tab.id),
-          result: evalResult?.result || "",
-          error: evalResult?.error || "",
-        },
+        { tab_id: String(tab.id), highlighted: String(scanResult?.highlighted || 0) },
+        Date.now(),
+      );
+    }
+    if (action?.action === "scanning_stop") {
+      const stopResult = await chrome.tabs.sendMessage(tab.id, {
+        type: "moonwalk_scanning_stop",
+      });
+      return buildActionResult(
+        action,
+        !!stopResult?.ok,
+        "Scanning stopped.",
+        metadata,
+        { tab_id: String(tab.id) },
         Date.now(),
       );
     }
@@ -277,13 +305,8 @@ async function executeActionOnTab(action) {
       chrome.tabs.sendMessage(tab.id, { type: "moonwalk_trigger_click_burst" }).catch(() => {});
     }
 
-    // After a successful action, request a fresh snapshot so the backend
-    // gets the post-action DOM state quickly. The content script's
-    // MutationObserver also fires, but an explicit request is faster for
-    // the very next agent iteration.
-    if (result?.ok) {
-      requestSnapshotFromTab(tab.id, action?.session_id || sessionId).catch(() => {});
-    }
+    // After a successful action, the content script's MutationObserver
+    // will fire a snapshot automatically — no explicit request needed.
 
     return buildActionResult(
       action,
@@ -551,11 +574,11 @@ async function pushActiveTabSnapshot() {
 // ── Chrome Event Listeners ──
 
 chrome.runtime.onInstalled.addListener(() => {
-  connectBridge();
+  loadSettings().then(() => connectBridge());
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  connectBridge();
+  loadSettings().then(() => connectBridge());
 });
 
 chrome.tabs.onActivated.addListener(() => {
@@ -613,8 +636,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "moonwalk_settings_updated") {
+    // Settings changed from options page — reconnect with new config
+    loadSettings().then(() => {
+      if (bridgeSocket) {
+        try { bridgeSocket.close(); } catch (_) {}
+      }
+      bridgeSocket = null;
+      authenticated = false;
+      connectBridge();
+    });
+    sendResponse({ ok: true });
+    return true;
+  }
+
   return false;
 });
 
 // ── Boot ──
-connectBridge();
+loadSettings().then(() => connectBridge());

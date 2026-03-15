@@ -120,10 +120,7 @@ class VoiceAssistant:
             except Exception as e:
                 print(f"[WS Callback] Error sending: {e}")
 
-        context, _ = await asyncio.gather(
-            perception.snapshot(text),
-            self.agent.router.initialize(),
-        )
+        context = await perception.snapshot(text)
 
         result = await self.agent.run(text, context, ws_callback=ws_callback)
 
@@ -352,6 +349,7 @@ class VoiceAssistant:
 async def main_handler(websocket):
     print("Electron App Connected!")
     assistant = VoiceAssistant()
+    await assistant.agent.router.initialize()
 
     # Initialize UI
     try:
@@ -441,13 +439,7 @@ async def main_handler(websocket):
                         }))
                         continue
 
-                    started = time.time()
-                    result = None
-                    while time.time() - started < timeout:
-                        result = browser_bridge.latest_action_result(queued.action_id)
-                        if result is not None:
-                            break
-                        await asyncio.sleep(0.1)
+                    result = await browser_bridge.wait_for_result(queued.action_id, timeout=timeout)
 
                     if result is None:
                         await websocket.send(json.dumps({
@@ -548,13 +540,7 @@ async def main_handler(websocket):
                         }))
                         continue
 
-                    started = time.time()
-                    result = None
-                    while time.time() - started < timeout:
-                        result = browser_bridge.latest_action_result(queued.action_id)
-                        if result is not None:
-                            break
-                        await asyncio.sleep(0.1)
+                    result = await browser_bridge.wait_for_result(queued.action_id, timeout=timeout)
 
                     if result is None:
                         await websocket.send(json.dumps({

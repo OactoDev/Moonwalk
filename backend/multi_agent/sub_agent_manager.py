@@ -8,6 +8,11 @@ Given a MilestonePlan, the manager:
 2. Identifies groups of milestones that can run in parallel
 3. Dispatches each group to RemoteExecutor instances
 4. Aggregates results and flows deliverables to dependent milestones
+
+SAFETY: Parallel execution is only used for milestones that don't
+interact with the UI/browser.  If any milestone in a group hints at
+UI-mutating or browser tools, the group is flattened to sequential
+to prevent shared-state race conditions.
 """
 
 import asyncio
@@ -23,6 +28,25 @@ print = partial(print, flush=True)
 from agent.planner import Milestone, MilestonePlan, MilestoneStatus
 from multi_agent import SubAgentConfig, SubAgentResult, SubAgentStatus
 from multi_agent.remote_executor import RemoteExecutor, _is_suspend_signal
+
+
+# Tools that mutate shared state (browser, UI, filesystem) and therefore
+# cannot safely run in parallel with other milestones.
+_PARALLEL_UNSAFE_TOOLS: frozenset[str] = frozenset({
+    # Browser / UI interaction
+    "open_url", "open_app", "quit_app", "close_window",
+    "browser_click_ref", "browser_type_ref", "browser_select_ref",
+    "browser_click_match", "browser_scroll", "browser_read_page",
+    "browser_read_text", "browser_refresh_refs", "browser_switch_tab",
+    "click_ui", "type_in_field", "type_text", "press_key",
+    "mouse_action", "run_shortcut", "click_element",
+    "find_and_act", "window_manager",
+    # Google Workspace via browser
+    "gdocs_create", "gdocs_append", "gsheets_create", "gsheets_write",
+    "gslides_create", "gslides_add_slide",
+    # Filesystem (potential conflicts on same files)
+    "write_file", "replace_in_file",
+})
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -235,7 +259,34 @@ class SubAgentManager:
         plan: MilestonePlan,
         execute_fn: Optional[Callable],
     ) -> List[SubAgentResult]:
-        """Execute multiple milestones in parallel via asyncio.gather."""
+        """Execute multiple milestones in parallel via asyncio.gather.
+        
+        If any milestone hints at UI/browser tools, fall back to sequential
+        execution to prevent shared-state race conditions.
+        """
+        # Safety check: if any milestone touches shared UI/browser state,
+        # execute the entire group sequentially to avoid conflicts.
+        has_unsafe = any(
+            any(
+                str(tool).strip() in _PARALLEL_UNSAFE_TOOLS
+                for tool in (m.hint_tools or [])
+            )
+            for m in milestones
+        )
+        if has_unsafe:
+            print(
+                f"[SubAgentManager] ⚠ Group has UI/browser tools — "
+                f"falling back to sequential for {len(milestones)} milestone(s)"
+            )
+            results: List[SubAgentResult] = []
+            for milestone in milestones:
+                result = await self._execute_single(
+                    milestone, deliverables, plan, execute_fn
+                )
+                self._apply_result(result, plan, deliverables)
+                results.append(result)
+            return results
+
         tasks = []
         for milestone in milestones:
             agent_id = f"parallel_{milestone.id}_{uuid.uuid4().hex[:6]}"

@@ -150,6 +150,7 @@ async def bridge_handler(websocket):
                 session_id = str(data.get("session_id", "browser-session"))
                 extension_name = str(data.get("extension_name", "chrome-extension"))
                 browser_bridge.register_connection(session_id=session_id, extension_name=extension_name)
+                browser_bridge.set_extension_ws(websocket)
                 authenticated = True
                 await _send(websocket, {
                     "type": "browser_bridge_hello_ack",
@@ -235,6 +236,7 @@ async def bridge_handler(websocket):
     except websockets.exceptions.ConnectionClosed as exc:
         print(f"[BrowserBridge] Client disconnected: {exc}")
     finally:
+        browser_bridge.clear_extension_ws()
         browser_bridge.disconnect()
 
 

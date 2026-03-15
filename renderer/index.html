@@ -10,7 +10,7 @@
 </head>
 
 <body>
-  <div class="stage">
+<div class="stage">
 
     <div id="glow" class="ambient-glow"></div>
 
@@ -174,6 +174,65 @@
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
       </button>
     </div>
+
+    <!-- ═══ Onboarding Modal (first-launch setup) ═══ -->
+    <div class="onboarding-overlay hidden" id="onboarding-overlay">
+      <div class="onboarding-card">
+        <div class="onboarding-header">
+          <svg class="onboarding-logo" viewBox="0 0 24 24" width="32" height="32">
+            <circle cx="12" cy="12" r="10" fill="none" stroke="#4c8dff" stroke-width="1.5"/>
+            <path d="M8 12 L11 15 L16 9" fill="none" stroke="#4c8dff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <h2 class="onboarding-title">Welcome to Moonwalk</h2>
+          <p class="onboarding-subtitle">Your AI desktop assistant</p>
+        </div>
+
+        <!-- Step 1: Setup -->
+        <div class="onboarding-step active" id="onboarding-step-1">
+          <div class="onboarding-body">
+            <p>Moonwalk uses voice and text to help you with tasks on your Mac.</p>
+            <div class="onboarding-checklist">
+              <div class="check-item" id="check-python">
+                <span class="check-icon">⏳</span>
+                <span>Python backend</span>
+              </div>
+              <div class="check-item" id="check-ws">
+                <span class="check-icon">⏳</span>
+                <span>WebSocket connection</span>
+              </div>
+              <div class="check-item" id="check-mic">
+                <span class="check-icon">⏳</span>
+                <span>Microphone access</span>
+              </div>
+            </div>
+          </div>
+          <button class="onboarding-btn" id="onboarding-next-1">Continue</button>
+        </div>
+
+        <!-- Step 2: Shortcuts -->
+        <div class="onboarding-step" id="onboarding-step-2">
+          <div class="onboarding-body">
+            <div class="shortcut-row">
+              <kbd>⌘</kbd><kbd>⇧</kbd><kbd>Space</kbd>
+              <span class="shortcut-label">Open Moonwalk</span>
+            </div>
+            <div class="shortcut-row">
+              <kbd>⌥</kbd><kbd>Space</kbd>
+              <span class="shortcut-label">Quick command</span>
+            </div>
+            <div class="shortcut-row">
+              <kbd>Esc</kbd>
+              <span class="shortcut-label">Dismiss</span>
+            </div>
+            <p class="onboarding-hint">Install the <strong>Moonwalk Browser Bridge</strong> Chrome extension for web automation.</p>
+          </div>
+          <button class="onboarding-btn" id="onboarding-done">Get Started</button>
+        </div>
+
+        <div class="onboarding-version" id="onboarding-version"></div>
+      </div>
+    </div>
+
   </div>
 
   <script src="../node_modules/katex/dist/katex.min.js"></script>

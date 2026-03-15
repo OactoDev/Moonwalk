@@ -2,9 +2,6 @@
 Moonwalk — Planner Types
 ========================
 Runtime dataclasses for milestone planning and step execution primitives.
-
-The active V2 runtime is milestone-first. Legacy step-plan compatibility
-builders and templates now live in `agent.legacy_planner`.
 """
 
 from dataclasses import dataclass, field
@@ -223,6 +220,7 @@ class ExecutionStep:
     error: Optional[str] = None
     retries: int = 0
     max_retries: int = 1
+    modal_data: Optional[Dict[str, Any]] = None  # Modal context attached during execution
 
     def to_dict(self) -> dict:
         return {

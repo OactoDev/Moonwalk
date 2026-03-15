@@ -53,43 +53,11 @@ _RAW_BROWSER_TOOLS: frozenset[str] = frozenset({
 
 _HARD_SAFETY_CAP = 50
 
-# UI-mutating tools that trigger auto-screen-recovery on failure
-_UI_MUTATING_TOOLS: frozenset[str] = frozenset({
-    "click_ui", "type_in_field", "type_text", "press_key",
-    "run_shortcut", "click_element", "hover_element", "mouse_action",
-    "browser_click_ref", "browser_type_ref", "browser_select_ref",
-    "browser_click_match", "find_and_act",
-    "open_app", "open_url", "quit_app", "close_window",
-})
-
-_TRIVIAL_PROGRESS_TOOLS: frozenset[str] = frozenset({
-    "open_url",
-    "browser_scroll",
-    "web_search",
-})
-
-_LOW_SIGNAL_ACTION_TOOLS: frozenset[str] = frozenset({
-    "press_key",
-    "run_shortcut",
-    "mouse_action",
-    "browser_scroll",
-    "web_search",
-})
-
-_RESPONSE_ONLY_MILESTONE_MARKERS: tuple[str, ...] = (
-    "send a response",
-    "send response",
-    "send the response",
-    "send a modal",
-    "show a modal",
-    "show the modal",
-    "product modal",
-    "deliver to the user",
-    "sent to the user",
-    "sent to user",
-    "via send_response",
-    "response is sent",
-    "modal is sent",
+# Import shared tool categories from the canonical source
+from agent.constants import (
+    UI_MUTATING_TOOLS as _UI_MUTATING_TOOLS,
+    TRIVIAL_PROGRESS_TOOLS as _TRIVIAL_PROGRESS_TOOLS,
+    LOW_SIGNAL_ACTION_TOOLS as _LOW_SIGNAL_ACTION_TOOLS,
 )
 
 _AWAIT_REPLY_SENTINEL = "AWAIT_REPLY:"
@@ -142,19 +110,22 @@ CRITICAL RULES:
 5. For browser interactions: always perceive before acting. Read content before interacting.
 5a. For web research, prefer `get_web_information(...)` over raw mechanism choices. It can search, choose a promising result, follow it in the browser, and then return page content/summary/structured items in one call when you provide a `query` with `target_type=page_content|page_summary|structured_data`. Use `target_type=search_results` only when you explicitly need the result list itself.
 5b. After you get usable search results, FOLLOW THEM. Do not issue another similar search if you already have relevant result URLs. Open or read one of the authoritative sources next.
-6. For writing tools (gdocs_create, gdocs_append): prefer setting "title" only when the
-   document content can be synthesized from prior research or from the task itself.
-   Only provide "body" or "text" directly if you already have concrete content that must
-   be preserved verbatim.
+6. For writing tools (gdocs_create, gdocs_append): set "title" only. Body content is
+   synthesized automatically from collected research. NEVER set "body" or "text".
 7. NEVER fabricate data. If you need information, search/read for it first.
 8. Output ONLY valid JSON — no markdown, no explanation outside the JSON.
 9. Each action should make meaningful progress. Avoid repeating failed actions identically.
 10. Use deliverables from previous milestones when available — they contain real data.
 11. Prefer `web_scrape` over `run_python` for web extraction. Use `run_python` only as a last resort.
 12. Active skill overlays are ADVISORY. Use them to guide strategy, but adapt to real observations and evidence.
-13. In desktop chat apps, prefer `type_in_field` to focus Search or Message inputs before relying on repeated `press_key` navigation.
+13. In desktop chat apps (WhatsApp, Messages, Slack, Discord, Telegram), prefer `click_ui` and `type_in_field` to interact with the UI. Use `click_ui` to click the search bar or a contact name, and `type_in_field` to type a search query or message. Use `press_key` with key="Return" to send messages.
 14. If a tool says it could not find the requested UI element or field, treat that as a failure and change strategy — do not count it as progress.
-15. For "send it again" or repeat-message requests, reuse `last_typed_text` from the environment with `type_text`/`type_in_field`. Do not assume the clipboard contains the right message unless the clipboard content clearly matches."""
+15. For "send it again" or repeat-message requests, reuse `last_typed_text` from the environment with `type_text`/`type_in_field`. Do not assume the clipboard contains the right message unless the clipboard content clearly matches.
+16. Do NOT repeatedly call `open_app` for the same app — once is enough. If the app is open but you can't see the right content, use UI interaction tools (`click_ui`, `type_in_field`, `get_ui_tree`) to navigate within the app.
+17. After `open_app`, ALWAYS call `read_screen` first before any other UI tool. This confirms the app is actually visible and gives you the UI layout for accurate interactions.
+18. If `get_ui_tree` times out or returns nothing useful, fall back to `read_screen` + `click_ui` to interact visually instead. Do NOT retry `get_ui_tree` with the same arguments.
+19. Do NOT use keyboard shortcuts (e.g., `command+f`) in desktop chat apps. Instead use `click_ui` to click buttons and UI elements directly — they are more reliable across different app versions.
+20. If `type_in_field` cannot find a field, try `click_ui` to click the target area first, then use `type_text` to type into the now-focused field."""
 
 MILESTONE_EXECUTOR_PROMPT = """\
 ## Overall Task
@@ -377,6 +348,90 @@ class MilestoneExecutor:
                     return "\n".join(lines)
         return "\n".join(lines) if lines else "  (none yet)"
 
+    async def _stream_llm_decision(
+        self,
+        prompt: str,
+        ws_callback=None,
+    ) -> tuple[Optional[str], float]:
+        """Stream LLM response and parse JSON decision as early as possible.
+
+        Uses generate_stream() to accumulate text chunks and attempts JSON
+        parsing as soon as the accumulated text looks structurally complete
+        (balanced braces).  Falls back to non-streaming generate() if the
+        provider doesn't support streaming.
+
+        Returns:
+            (response_text, elapsed_seconds) or (None, elapsed) on failure.
+        """
+        t0 = _time.time()
+
+        # ── Fast-path: provider supports streaming ──
+        if hasattr(self.provider, "generate_stream"):
+            accumulated = ""
+            brace_depth = 0
+            in_string = False
+            escape_next = False
+            json_complete = False
+
+            try:
+                async for chunk in self.provider.generate_stream(
+                    messages=[{"role": "user", "parts": [{"text": prompt}]}],
+                    system_prompt=MILESTONE_EXECUTOR_SYSTEM,
+                    tools=[],
+                    temperature=0.15,
+                ):
+                    if chunk.error:
+                        print(f"[MilestoneExec] ⚠ Stream error: {chunk.error}")
+                        break
+                    if chunk.text:
+                        accumulated += chunk.text
+
+                        # Track brace depth for early JSON completion detection
+                        for ch in chunk.text:
+                            if escape_next:
+                                escape_next = False
+                                continue
+                            if ch == "\\" and in_string:
+                                escape_next = True
+                                continue
+                            if ch == '"' and not escape_next:
+                                in_string = not in_string
+                                continue
+                            if in_string:
+                                continue
+                            if ch == "{":
+                                brace_depth += 1
+                            elif ch == "}":
+                                brace_depth -= 1
+                                if brace_depth == 0 and accumulated.strip():
+                                    json_complete = True
+
+                        if json_complete:
+                            # JSON is structurally complete — stop streaming early
+                            break
+
+                elapsed = _time.time() - t0
+                if accumulated.strip():
+                    return accumulated, elapsed
+
+            except Exception as e:
+                print(f"[MilestoneExec] ⚠ Streaming failed, falling back: {e}")
+
+        # ── Fallback: non-streaming generate() ──
+        try:
+            response = await self.provider.generate(
+                messages=[{"role": "user", "parts": [{"text": prompt}]}],
+                system_prompt=MILESTONE_EXECUTOR_SYSTEM,
+                tools=[],
+                temperature=0.15,
+            )
+            elapsed = _time.time() - t0
+            return (response.text if response and response.text else None), elapsed
+        except Exception as e:
+            elapsed = _time.time() - t0
+            print(f"[MilestoneExec] ⚠ LLM generate failed: {e}")
+            return None, elapsed
+
     async def execute_milestone(
         self,
         milestone: Milestone,
@@ -413,34 +468,87 @@ class MilestoneExecutor:
         blocked_awaits = set(blocked_await_signatures or set())
         tool_list_text = self._format_tool_list(priority_tool_names)
 
+        # ── Glance: lightweight parallel screen awareness ──
+        from agent.glance import get_glance
+        glance = get_glance()
+        _last_tool_name = ""       # tracks previous tool for app-change detection
+        _last_tool_success = True  # tracks previous tool outcome
+
         action_num = 0
         decision_failures = 0
         consecutive_rejections = 0
         stall_warning = "  (none)"
         blocked_search_failures: dict[str, str] = {}
+        # Cache successful get_web_information results to avoid redundant network calls
+        _web_call_cache: dict[str, str] = {}
+        # Track consecutive Flash timeouts per (url, target_type) for circuit-breaker hint
+        _flash_timeout_registry: dict[str, int] = {}
 
         while action_num < _HARD_SAFETY_CAP:
             milestone.actions_taken = action_num
 
+            # 0. Check for request cancellation
+            from runtime_state import runtime_state_store as _rss
+            if _rss.is_request_cancelled():
+                print(f"[MilestoneExec] ⛔ Milestone {milestone.id} cancelled by user.")
+                return False, "Cancelled by user."
+
             # 1. Perceive environment
             env_state = await env_perceiver()
+
+            # 1b. Glance: inject lightweight screen awareness
+            #     peek() is ~0ms if cached, ~150ms if stale. Zero tokens.
+            try:
+                glance_result = await glance.peek()
+                app_changed = glance.detect_app_change(glance_result)
+
+                # If the last tool was open_app and the app actually changed,
+                # or if the last UI tool failed, consider a deep look.
+                if glance.should_deep_look(_last_tool_name, _last_tool_success, app_changed):
+                    if ws_callback:
+                        await ws_callback({
+                            "type": "doing",
+                            "text": "Looking at screen…",
+                            "tool": "glance",
+                            "variant": "looking",
+                        })
+                    glance_result = await glance.deep_look(
+                        f"What app is currently in the foreground? "
+                        f"I just ran '{_last_tool_name}'. Is the expected UI visible?"
+                    )
+
+                # Inject glance summary into environment when UI tools are likely
+                _ui_tools = {"click_ui", "type_in_field", "click_element", "get_ui_tree",
+                             "read_screen", "type_text", "press_key"}
+                if (milestone.hint_tools and
+                        any(ht in _ui_tools for ht in milestone.hint_tools)):
+                    glance_ctx = glance.build_context("click_ui", glance_result)
+                    if glance_ctx:
+                        env_state["screen_glance"] = glance_ctx
+            except Exception as e:
+                print(f"[MilestoneExec] ⚠ Glance failed (non-fatal): {e}")
+
             env_lines = [f"  {k}: {v}" for k, v in env_state.items() if v]
             env_str = "\n".join(env_lines) if env_lines else "  (no environment data)"
 
-            # 2. Build action history
+            # 2. Build action history (last 3 only to reduce prompt size)
             history_lines: list[str] = []
-            for i, a in enumerate(actions, 1):
+            recent_actions = actions[-3:] if len(actions) > 3 else actions
+            start_idx = len(actions) - len(recent_actions) + 1
+            if len(actions) > 3:
+                history_lines.append(f"  ... ({len(actions) - 3} earlier actions omitted)")
+            for i, a in enumerate(recent_actions, start_idx):
                 icon = "✓" if a.success else "✗"
                 result_preview = (a.result[:150] if a.result else a.error[:100]).replace("\n", " ")
                 history_lines.append(f"  {icon} Action {i}: {a.tool} → {result_preview}")
             action_history = "\n".join(history_lines) if history_lines else "  (none yet)"
 
-            # 3. Build deliverables summary
+            # 3. Build deliverables summary (truncate each to 200 chars)
             deliv_lines: list[str] = []
             for mid, dval in deliverables.items():
                 m = next((m for m in plan.milestones if m.id == mid), None)
                 label = m.goal if m else f"Milestone {mid}"
-                deliv_lines.append(f"  [{mid}] {label}: {str(dval)[:300]}")
+                deliv_lines.append(f"  [{mid}] {label}: {str(dval)[:200]}")
             deliv_str = "\n".join(deliv_lines) if deliv_lines else "  (none — this is the first milestone)"
 
             # 4. Build prompt
@@ -463,27 +571,22 @@ class MilestoneExecutor:
                 tool_list=tool_list_text,
             )
 
-            # 5. Ask LLM what to do
+            # 5. Ask LLM what to do (streaming with early JSON parse)
             t_llm = _time.time()
             try:
-                response = await self.provider.generate(
-                    messages=[{"role": "user", "parts": [{"text": prompt}]}],
-                    system_prompt=MILESTONE_EXECUTOR_SYSTEM,
-                    tools=[],
-                    temperature=0.15,
+                response_text, llm_elapsed = await self._stream_llm_decision(
+                    prompt, ws_callback=ws_callback,
                 )
-                llm_elapsed = _time.time() - t_llm
 
-                if not response or not response.text:
-                    err_msg = response.error if (response and hasattr(response, "error") and response.error) else "No text returned"
-                    print(f"[MilestoneExec] ⚠ Empty LLM response at action {action_num + 1} (Reason: {err_msg})")
+                if not response_text:
+                    print(f"[MilestoneExec] ⚠ Empty LLM response at action {action_num + 1}")
                     decision_failures += 1
                     if decision_failures >= 3:
                         print(f"[MilestoneExec] ⚠ Stalled: too many empty LLM responses")
                         break
                     continue
 
-                decision = self._parse_decision(response.text)
+                decision = self._parse_decision(response_text)
                 print(
                     f"[MilestoneExec]   Action {action_num + 1}: "
                     f"{'DONE' if decision.get('done') else decision.get('tool', '?')} "
@@ -592,19 +695,96 @@ class MilestoneExecutor:
                     print(f"[MilestoneExec] ⚠ Stalled: repeated failed search selections")
                     break
                 continue
+
+            # Cache hit: serve a previously successful get_web_information result without
+            # a network round-trip.  Key on (target_type, url, query) — same call same result.
+            if tool == "get_web_information":
+                _t = str((args or {}).get("target_type", "")).strip().lower()
+                _u = str((args or {}).get("url", "") or (args or {}).get("source_url", "") or "").strip().rstrip("/")
+                _q = " ".join(str((args or {}).get("query", "")).strip().lower().split())
+                _wck = f"{_t}|{_u}|{_q}"
+                if _wck in _web_call_cache:
+                    _cached = _web_call_cache[_wck]
+                    print(f"[MilestoneExec] ⚡ Cache hit {_wck[:60]} — reusing {len(_cached)}ch result")
+                    action = MilestoneAction(
+                        tool=tool, args=args, result=_cached, success=True, error="", duration=0.0,
+                    )
+                    actions.append(action)
+                    last_result = _cached[:800]
+                    action_num += 1
+                    _cr, _nsw = self._detect_stall(actions)
+                    if not _cr:
+                        break
+                    stall_warning = f"  {_nsw}" if _nsw else "  (none)"
+                    continue
             decision_failures = 0
 
             # Stream progress to UI
             if ws_callback:
+                _BROWSER_TOOLS = {
+                    "get_web_information", "web_search", "open_url",
+                    "browser_click_ref", "browser_type_ref", "browser_select_ref",
+                    "browser_scroll", "browser_read_page", "browser_read_text",
+                    "read_page_content", "get_page_summary", "extract_structured_data",
+                    "browser_click_match", "browser_find", "browser_describe_ref",
+                }
+                _UI_INTERACTION_TOOLS = {
+                    "click_ui", "type_in_field", "click_element",
+                    "type_text", "press_key", "get_ui_tree",
+                }
+                if tool in _BROWSER_TOOLS:
+                    tool_variant = "browsing"
+                elif tool in _UI_INTERACTION_TOOLS:
+                    tool_variant = "looking"
+                else:
+                    tool_variant = ""
                 await ws_callback({
                     "type": "doing",
                     "text": description or f"Milestone {milestone.id}: {tool}",
                     "tool": tool,
+                    "variant": tool_variant,
                 })
+
+            # Glance: quick peek before UI tools so the LLM has fresh element data
+            if glance.should_peek_before(tool):
+                try:
+                    pre_glance = await glance.peek()
+                    if pre_glance.element_count > 0:
+                        print(f"[Glance] 👁 Pre-{tool}: {pre_glance.element_count} elements, "
+                              f"{len(pre_glance.text_fields)} fields, "
+                              f"{len(pre_glance.buttons)} buttons")
+                except Exception:
+                    pass
 
             t_exec = _time.time()
             result_str, success = await tool_executor(tool, args)
             exec_elapsed = _time.time() - t_exec
+
+            # Track for next-iteration glance decisions
+            _last_tool_name = tool
+            _last_tool_success = success
+
+            # Glance: post-execution verification for app-switching tools
+            if glance.should_peek_after(tool) and success:
+                try:
+                    # Invalidate cache so we get fresh data from new app
+                    glance._cache = None
+                    post_glance = await glance.refresh()
+                    expected_app = (args or {}).get("app_name", "")
+                    if (expected_app and
+                            expected_app.lower() not in post_glance.active_app.lower() and
+                            post_glance.active_app.lower() not in expected_app.lower()):
+                        # App didn't actually come to front — warn the LLM
+                        result_str += (
+                            f" ⚠ Glance: active app is '{post_glance.active_app}', "
+                            f"not '{expected_app}'. The target app may not have come to the foreground."
+                        )
+                        print(f"[Glance] ⚠ Post-open_app: expected '{expected_app}' "
+                              f"but active is '{post_glance.active_app}'")
+                    else:
+                        print(f"[Glance] ✓ Post-open_app: '{post_glance.active_app}' confirmed")
+                except Exception as e:
+                    print(f"[Glance] ⚠ Post-execution peek failed: {e}")
 
             action = MilestoneAction(
                 tool=tool,
@@ -616,6 +796,24 @@ class MilestoneExecutor:
             )
             actions.append(action)
             last_result = result_str[:800] if result_str else "(empty result)"
+
+            # Update web call cache and flash-timeout circuit breaker
+            if tool == "get_web_information":
+                _t = str((args or {}).get("target_type", "")).strip().lower()
+                _u = str((args or {}).get("url", "") or (args or {}).get("source_url", "") or "").strip().rstrip("/")
+                _q = " ".join(str((args or {}).get("query", "")).strip().lower().split())
+                _wck = f"{_t}|{_u}|{_q}"
+                if success:
+                    _web_call_cache[_wck] = result_str
+                    _flash_timeout_registry.pop(_wck, None)  # reset on success
+                elif "timed out" in (result_str or "").lower():
+                    _flash_timeout_registry[_wck] = _flash_timeout_registry.get(_wck, 0) + 1
+                    if _flash_timeout_registry[_wck] >= 2:
+                        result_str = (
+                            f"⚡ Flash timed out {_flash_timeout_registry[_wck]}× for this URL+type. "
+                            f"Switch to target_type='page_content' for this URL instead of '{_t}'."
+                        )
+                        last_result = result_str
 
             print(
                 f"[MilestoneExec]   {'✓' if success else '✗'} {tool} ({exec_elapsed:.2f}s) "
@@ -666,15 +864,6 @@ class MilestoneExecutor:
                 milestone.result_summary = result_str[:500]
                 return False, _AWAIT_REPLY_SENTINEL + json.dumps(payload, ensure_ascii=False)
 
-            if tool == "send_response" and success and self._is_response_only_milestone(milestone):
-                milestone.actions_taken = action_num + 1
-                milestone.result_summary = self._send_response_completion_summary(
-                    milestone=milestone,
-                    args=args,
-                    result_text=result_str,
-                )
-                return True, milestone.result_summary
-
             action_num += 1
             continue_running, next_stall_warning = self._detect_stall(actions)
             if not continue_running:
@@ -705,30 +894,15 @@ class MilestoneExecutor:
         except Exception:
             return str(args or {})
 
-    def _is_response_only_milestone(self, milestone: Milestone) -> bool:
-        text = f"{milestone.goal or ''} {milestone.success_signal or ''}".lower()
-        hint_tools = {str(tool).strip() for tool in (milestone.hint_tools or []) if str(tool).strip()}
-        non_response_hints = hint_tools.difference({"send_response"})
-        return bool(text) and any(marker in text for marker in _RESPONSE_ONLY_MILESTONE_MARKERS) and not non_response_hints
-
-    def _send_response_completion_summary(self, milestone: Milestone, args: dict, result_text: str) -> str:
-        modal = str((args or {}).get("modal", "")).strip().lower()
-        if modal in {"cards", "products"}:
-            return "Product modal sent to user."
-        if modal:
-            return f"{modal.title()} modal sent to user."
-        if result_text:
-            return str(result_text).strip()[:500]
-        return "Response sent to user."
-
     def _search_retry_key(self, tool: str, args: dict) -> str:
         if tool != "get_web_information":
             return ""
         target_type = str((args or {}).get("target_type", "")).strip().lower()
-        if target_type != "search_results":
-            return ""
+        url = str((args or {}).get("url", "") or (args or {}).get("source_url", "") or "").strip().rstrip("/")
         query = " ".join(str((args or {}).get("query", "")).strip().lower().split())
-        return f"{tool}|{target_type}|{query}"
+        # Key covers all target_types so repeated failures on page_content / structured_data
+        # are blocked the same way as repeated failed searches.
+        return f"{tool}|{target_type}|{url}|{query}"
 
     def _search_failure_summary(self, tool: str, args: dict, result_text: str) -> str:
         retry_key = self._search_retry_key(tool, args)
@@ -769,12 +943,24 @@ class MilestoneExecutor:
             return True
         return False
 
+    # Tools whose output is legitimately short (confirmations, status messages).
+    # These should never count as "zero-yield" even when the result is < 60 chars.
+    _SHORT_OUTPUT_TOOLS: frozenset[str] = frozenset({
+        "open_app", "quit_app", "close_window", "press_key",
+        "run_shortcut", "type_text", "type_in_field", "click_ui",
+        "browser_scroll", "browser_switch_tab", "open_url",
+        "send_response", "await_reply", "send_imessage",
+    })
+
     def _is_zero_yield_action(self, action: MilestoneAction) -> bool:
         """Zero-yield = tool call succeeded but produced no substantive output."""
         if not action.success:
             return False
+        # Short-output tools legitimately return brief confirmations
+        if action.tool in self._SHORT_OUTPUT_TOOLS:
+            return False
         result_text = (action.result or "").strip()
-        if len(result_text) < 60:
+        if len(result_text) < 30:
             return True
         return self._is_known_empty_json(result_text)
 
@@ -782,13 +968,24 @@ class MilestoneExecutor:
         """Detect milestone stalls and produce warning text for next LLM turn."""
         warning = ""
 
+        # Count consecutive identical actions (same tool + same args)
+        identical_streak = 0
         if len(actions) >= 2:
             last = actions[-1]
-            prev = actions[-2]
-            if last.tool == prev.tool and self._stable_args(last.args) == self._stable_args(prev.args):
+            last_sig = f"{last.tool}|{self._stable_args(last.args)}"
+            for action in reversed(actions):
+                sig = f"{action.tool}|{self._stable_args(action.args)}"
+                if sig == last_sig:
+                    identical_streak += 1
+                else:
+                    break
+            if identical_streak >= 3:
+                return False, f"three consecutive identical {last.tool} calls with same args — the approach is not working"
+            if identical_streak >= 2:
                 warning = (
-                    f"Repeated identical action detected: {last.tool} with same args. "
-                    "Choose a different tool or arguments."
+                    f"Repeated identical action detected: {last.tool} with same args "
+                    f"({identical_streak}×). You MUST try a completely different tool or approach. "
+                    "For messaging apps: use click_ui or type_in_field to interact with the UI."
                 )
 
         zero_yield_streak = 0
@@ -797,8 +994,8 @@ class MilestoneExecutor:
                 zero_yield_streak += 1
             else:
                 break
-        if zero_yield_streak >= 3:
-            return False, "three consecutive zero-yield actions"
+        if zero_yield_streak >= 4:
+            return False, "four consecutive zero-yield actions"
 
         recent_search_queries: list[str] = []
         recent_search_with_items = 0
@@ -863,6 +1060,9 @@ class MilestoneExecutor:
             return False
         if action.tool in _TRIVIAL_PROGRESS_TOOLS:
             return False
+        # Short-output tools (open_app, click_ui, etc.) are substantive by nature
+        if action.tool in self._SHORT_OUTPUT_TOOLS:
+            return True
         result_text = (action.result or "").strip()
         result_lower = result_text.lower()
         if any(marker in result_lower for marker in _FAILED_UI_RESULT_MARKERS):

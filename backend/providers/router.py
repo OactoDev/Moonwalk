@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import time
@@ -129,60 +130,68 @@ class ModelRouter:
         self._router: Optional[GeminiProvider] = None
         self._fast: Optional[GeminiProvider] = None
         self._powerful: Optional[GeminiProvider] = None
+        self._fallback: Optional[GeminiProvider] = None
         self._initialized = False
+        self._init_lock = asyncio.Lock()
 
     async def initialize(self):
-        """Lazily init Gemini providers."""
+        """Lazily init Gemini providers. Thread-safe via asyncio.Lock."""
         if self._initialized:
             return
-        self._initialized = True
+        async with self._init_lock:
+            # Double-check after acquiring lock
+            if self._initialized:
+                return
 
-        api_key = os.environ.get("GEMINI_API_KEY", "")
-        if not api_key:
-            print("[Router] ✗ No GEMINI_API_KEY set — agent cannot function.")
-            return
+            api_key = os.environ.get("GEMINI_API_KEY", "")
+            if not api_key:
+                print("[Router] ✗ No GEMINI_API_KEY set — agent cannot function.")
+                return
 
-        def get_provider(model_name: str) -> GeminiProvider:
-            return GeminiProvider(api_key=api_key, model=model_name)
+            def get_provider(model_name: str) -> GeminiProvider:
+                return GeminiProvider(api_key=api_key, model=model_name)
 
-        # Routing model (ultra-cheap, ultra-fast tier 0)
-        routing_name = os.environ.get("GEMINI_ROUTING_MODEL", ROUTING_MODEL)
-        self._router = get_provider(routing_name)
-        if self._router and await self._router.is_available():
-            print(f"[Router] ✓ ROUTER (classifier): {routing_name}")
-        else:
-            print(f"[Router] ✗ ROUTER failed: {routing_name}")
-            self._router = None
+            # Routing model (ultra-cheap, ultra-fast tier 0)
+            routing_name = os.environ.get("GEMINI_ROUTING_MODEL", ROUTING_MODEL)
+            self._router = get_provider(routing_name)
+            if self._router and await self._router.is_available():
+                print(f"[Router] ✓ ROUTER (classifier): {routing_name}")
+            else:
+                print(f"[Router] ✗ ROUTER failed: {routing_name}")
+                self._router = None
 
-        # Fast model (cheap, simple tasks)
-        fast_name = os.environ.get("GEMINI_FAST_MODEL", FAST_MODEL)
-        self._fast = get_provider(fast_name)
-        if self._fast and await self._fast.is_available():
-            print(f"[Router] ✓ FAST (simple tasks): {fast_name}")
-        else:
-            print(f"[Router] ✗ FAST failed: {fast_name}")
-            self._fast = None
+            # Fast model (cheap, simple tasks)
+            fast_name = os.environ.get("GEMINI_FAST_MODEL", FAST_MODEL)
+            self._fast = get_provider(fast_name)
+            if self._fast and await self._fast.is_available():
+                print(f"[Router] ✓ FAST (simple tasks): {fast_name}")
+            else:
+                print(f"[Router] ✗ FAST failed: {fast_name}")
+                self._fast = None
 
-        # Powerful model (complex/multimodal)
-        powerful_name = os.environ.get("GEMINI_POWERFUL_MODEL", POWERFUL_MODEL)
-        self._powerful = get_provider(powerful_name)
-        if self._powerful and await self._powerful.is_available():
-            print(f"[Router] ✓ POWERFUL (escalation): {powerful_name}")
-        else:
-            print(f"[Router] ✗ POWERFUL failed: {powerful_name}")
-            self._powerful = None
+            # Powerful model (complex/multimodal)
+            powerful_name = os.environ.get("GEMINI_POWERFUL_MODEL", POWERFUL_MODEL)
+            self._powerful = get_provider(powerful_name)
+            if self._powerful and await self._powerful.is_available():
+                print(f"[Router] ✓ POWERFUL (escalation): {powerful_name}")
+            else:
+                print(f"[Router] ✗ POWERFUL failed: {powerful_name}")
+                self._powerful = None
 
-        # Fallback model (for when primary models fail)
-        fallback_name = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-pro")
-        self._fallback = get_provider(fallback_name)
-        if self._fallback and await self._fallback.is_available():
-            print(f"[Router] ✓ FALLBACK (emergency): {fallback_name}")
-        else:
-            print(f"[Router] ✗ FALLBACK failed: {fallback_name}")
-            self._fallback = None
+            # Fallback model (for when primary models fail)
+            fallback_name = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-pro")
+            self._fallback = get_provider(fallback_name)
+            if self._fallback and await self._fallback.is_available():
+                print(f"[Router] ✓ FALLBACK (emergency): {fallback_name}")
+            else:
+                print(f"[Router] ✗ FALLBACK failed: {fallback_name}")
+                self._fallback = None
 
-        # Summary
-        print(f"[Router] Ready: Using dedicated routing model")
+            # Summary
+            print(f"[Router] Ready: Using dedicated routing model")
+
+            # Mark initialized only after everything is set up
+            self._initialized = True
 
     @property
     def fallback(self):
@@ -219,6 +228,17 @@ class ModelRouter:
                 provider=self._fast,
                 reason="Deterministic trivial request → Flash",
                 model_name=self._fast._model,
+            )
+
+        # Deterministic POWERFUL classification — skip LLM call for obviously complex requests
+        if self._powerful and self._looks_obviously_powerful(text):
+            ms = (time.time() - start) * 1000
+            print(f"[Router] → POWERFUL ({ms:.0f}ms): Deterministic complex request")
+            return RouteDecision(
+                tier=Tier.POWERFUL,
+                provider=self._powerful,
+                reason="Deterministic complex request → Pro",
+                model_name=self._powerful._model,
             )
 
         # If only Flash is available, use Flash for everything
@@ -292,9 +312,54 @@ class ModelRouter:
             return True
         return False
 
+    def _looks_obviously_powerful(self, text: str) -> bool:
+        """Deterministic check for obviously complex requests → skip LLM routing call."""
+        normalized = (text or "").strip().lower()
+        if not normalized:
+            return False
+        # Length heuristic: longer requests are almost always complex
+        if len(normalized) > 80:
+            return True
+        # Multi-step indicators
+        if any(phrase in normalized for phrase in (
+            " and ", " then ", " after that", " also ", " next ",
+            " step ", " first ", " second ", " finally ",
+        )):
+            return True
+        # Browser / web tasks
+        if any(token in normalized for token in (
+            "browser", "click", "http://", "https://", "www.", "webpage",
+            "website", "search for", "google", "look up", "navigate to",
+            "go to ", "open the page", "fill in", "fill out", "submit",
+            "login", "log in", "sign in", "sign up",
+        )):
+            return True
+        # Reading / analysis / writing tasks
+        if any(token in normalized for token in (
+            "read ", "analyze", "analyse", "summarize", "summarise",
+            "research", "compare", "write ", "draft ", "compose",
+            "email", "document", "report", "review ",
+        )):
+            return True
+        # Follow-up / context-dependent
+        if normalized in {"yes", "proceed", "go ahead", "do it", "approved",
+                          "start", "continue", "ok", "sure", "yep", "yeah"}:
+            return True
+        # Pronoun references need conversation context
+        if any(re.search(rf"\b{p}\b", normalized) for p in ("it", "this", "that", "them", "those")):
+            return True
+        # Questions requiring reasoning
+        if any(normalized.startswith(q) for q in (
+            "how ", "why ", "what if ", "can you ", "could you ", "would you ",
+            "help me ", "find ", "show me ", "tell me about ",
+        )):
+            return True
+        return False
+
     async def _classify_with_router(self, text: str, context_summary: str) -> Tier:
         """
         Ask Router model to classify: should this be FAST or POWERFUL?
+        Uses the provider abstraction rather than direct SDK calls.
         """
         router = self._router or self._fast
         if not router:
@@ -305,18 +370,14 @@ class ModelRouter:
             classify_input += f"\nDesktop context: {context_summary}"
 
         try:
-            from google.genai import types as genai_types
-            response = await router._client.aio.models.generate_content(
-                model=router._model,
-                contents=[{"role": "user", "parts": [{"text": classify_input}]}],
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=ROUTING_PROMPT,
-                    temperature=0.0,
-                    max_output_tokens=2,  # Just need "FAST" or "POWERFUL"
-                )
+            response = await router.generate(
+                messages=[{"role": "user", "parts": [{"text": classify_input}]}],
+                system_prompt=ROUTING_PROMPT,
+                tools=[],
+                temperature=0.0,
             )
 
-            if response.text:
+            if response and response.text:
                 answer = response.text.strip().upper()
                 if "POWERFUL" in answer:
                     return Tier.POWERFUL

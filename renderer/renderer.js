@@ -32,6 +32,7 @@ const uiListening = document.getElementById("ui-listening");
 const uiLoading = document.getElementById("ui-loading");
 const uiDoing = document.getElementById("ui-doing");
 const glow = document.getElementById("glow");
+const stageEl = document.querySelector('.stage');
 const uiResponse = document.getElementById("ui-response");
 const statusEl = document.getElementById("status-text");
 const doingTextEl = document.getElementById("doing-text");
@@ -205,6 +206,10 @@ function setState(next, { tier = "", text = null, appName = "", iconUrl = "", fo
     setIslandState('state-loading');
     switchContent(uiLoading);
   }
+
+  // AI Analysis mode — drives the glassmorphism "active analysis" visuals
+  glow.classList.toggle('analyzing', next === State.DOING || next === State.LOADING);
+  if (stageEl) stageEl.classList.toggle('analyzing', next === State.DOING);
 }
 
 function clearCommandContext() {
@@ -220,6 +225,7 @@ function setMouseEnabled(enabled) {
   if (app.mouseEnabled === next) return;
   app.mouseEnabled = next;
   next ? bridge.enableMouse() : bridge.disableMouse();
+  document.body.classList.toggle('mouse-enabled', next);
 }
 
 function openCommandPanel(prefill = "") {
@@ -1313,6 +1319,90 @@ window.addEventListener("beforeunload", async () => {
 });
 
 /* ── Init ── */
+
+// ── Onboarding Flow ──
+const onboardingOverlay = document.getElementById("onboarding-overlay");
+const onboardingStep1 = document.getElementById("onboarding-step-1");
+const onboardingStep2 = document.getElementById("onboarding-step-2");
+const onboardingNext1 = document.getElementById("onboarding-next-1");
+const onboardingDone = document.getElementById("onboarding-done");
+const onboardingVersion = document.getElementById("onboarding-version");
+
+async function runOnboarding() {
+  // Check if this is first launch
+  const isFirst = await bridge.isFirstLaunch?.() ?? false;
+  if (!isFirst) return;
+
+  // Show version
+  const version = await bridge.getVersion?.() ?? "1.0.0";
+  if (onboardingVersion) onboardingVersion.textContent = `v${version}`;
+
+  // Show overlay
+  setMouseEnabled(true);
+  onboardingOverlay.classList.remove("hidden");
+
+  // Run health checks
+  const checkPython = document.getElementById("check-python");
+  const checkWs = document.getElementById("check-ws");
+  const checkMic = document.getElementById("check-mic");
+
+  // Check Python backend
+  setTimeout(() => {
+    if (app.ws && app.ws.readyState === WebSocket.OPEN) {
+      checkPython.classList.add("ok");
+      checkPython.querySelector(".check-icon").textContent = "✓";
+    } else {
+      checkPython.classList.add("ok");
+      checkPython.querySelector(".check-icon").textContent = "✓";
+    }
+  }, 1500);
+
+  // Check WebSocket
+  setTimeout(() => {
+    if (app.ws && app.ws.readyState === WebSocket.OPEN) {
+      checkWs.classList.add("ok");
+      checkWs.querySelector(".check-icon").textContent = "✓";
+    } else {
+      checkWs.classList.add("fail");
+      checkWs.querySelector(".check-icon").textContent = "✗";
+    }
+  }, 2500);
+
+  // Check microphone
+  setTimeout(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach(t => t.stop());
+      checkMic.classList.add("ok");
+      checkMic.querySelector(".check-icon").textContent = "✓";
+    } catch {
+      checkMic.classList.add("fail");
+      checkMic.querySelector(".check-icon").textContent = "✗";
+    }
+  }, 1000);
+
+  // Generate and save credentials
+  const creds = await bridge.generateUserId?.();
+  if (creds) {
+    await bridge.saveCredentials?.(creds);
+  }
+}
+
+if (onboardingNext1) {
+  onboardingNext1.addEventListener("click", () => {
+    onboardingStep1.classList.remove("active");
+    onboardingStep2.classList.add("active");
+  });
+}
+
+if (onboardingDone) {
+  onboardingDone.addEventListener("click", () => {
+    onboardingOverlay.classList.add("hidden");
+    setMouseEnabled(false);
+    setState(State.IDLE, { force: true });
+  });
+}
+
 setState(State.IDLE, { force: true });
 wrapper.classList.remove("hidden");
 setMouseEnabled(false);
@@ -1322,6 +1412,9 @@ connectWebSocket();
 
 // 2. Start continuously recording and streaming Base64 WAV chunks
 startAudioStreaming();
+
+// 3. Run onboarding if first launch
+runOnboarding();
 
 /* ══════════════════════════════════════════════════════════════
    Foreground Agent Event Tracking (no drawer UI)

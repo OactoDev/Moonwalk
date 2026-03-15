@@ -14,4 +14,15 @@ contextBridge.exposeInMainWorld("overlayAPI", {
   },
   logError: (msg) => ipcRenderer.send("log-error", msg),
   logInfo: (msg) => ipcRenderer.send("log-info", msg),
+
+  // ── Auth / Credentials ──
+  loadCredentials: () => ipcRenderer.invoke("auth:load-credentials"),
+  saveCredentials: (creds) => ipcRenderer.invoke("auth:save-credentials", creds),
+  generateUserId: () => ipcRenderer.invoke("auth:generate-user-id"),
+  clearCredentials: () => ipcRenderer.invoke("auth:clear-credentials"),
+  isFirstLaunch: () => ipcRenderer.invoke("auth:is-first-launch"),
+
+  // ── App info ──
+  getVersion: () => ipcRenderer.invoke("app:get-version"),
+  isPackaged: () => ipcRenderer.invoke("app:is-packaged"),
 });

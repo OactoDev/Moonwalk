@@ -14,8 +14,20 @@ import asyncio
 import subprocess
 from dataclasses import dataclass, field
 from typing import Callable, Any, Optional
-from tools.contracts import dumps as contract_dumps
+
 from tools.contracts import error_envelope
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Configuration
+# ═══════════════════════════════════════════════════════════════
+
+# Default timeout for tool execution (seconds).
+# Individual tools can override via the `timeout` decorator kwarg.
+DEFAULT_TOOL_TIMEOUT: float = 60.0
+
+# Maximum allowed timeout (prevents accidental infinite waits).
+MAX_TOOL_TIMEOUT: float = 300.0
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -49,6 +61,8 @@ class ToolDef:
     description: str
     parameters: dict          # JSON-schema style
     func: Callable            # The actual async function
+    timeout: float = DEFAULT_TOOL_TIMEOUT  # Per-tool timeout in seconds
+    reasoning_exempt: bool = False  # If True, no reasoning arg injected
 
 
 class ToolRegistry:
@@ -57,14 +71,32 @@ class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, ToolDef] = {}
 
-    def register(self, name: str, description: str, parameters: dict):
-        """Decorator to register a tool function."""
+    def register(
+        self,
+        name: str,
+        description: str,
+        parameters: dict,
+        timeout: float = DEFAULT_TOOL_TIMEOUT,
+        reasoning_exempt: bool = False,
+    ):
+        """Decorator to register a tool function.
+        
+        Args:
+            name: Tool name visible to the LLM.
+            description: Tool description.
+            parameters: JSON-schema style parameter spec.
+            timeout: Max seconds the tool may run before being cancelled.
+            reasoning_exempt: If True, no ``reasoning`` arg is injected.
+        """
+        _timeout = min(max(1.0, float(timeout)), MAX_TOOL_TIMEOUT)
         def decorator(func: Callable):
             self._tools[name] = ToolDef(
                 name=name,
                 description=description,
                 parameters=parameters,
                 func=func,
+                timeout=_timeout,
+                reasoning_exempt=reasoning_exempt,
             )
             return func
         return decorator
@@ -74,27 +106,39 @@ class ToolRegistry:
 
         The ``reasoning`` key is silently stripped from *args* so tool
         functions never need to accept it.  Returns result string.
+
+        Enforces a per-tool timeout to prevent hung tools from blocking
+        the agent indefinitely.
         """
         tool = self._tools.get(name)
         if not tool:
-            return contract_dumps(error_envelope(
-                "tool.unknown",
-                f"Unknown tool '{name}'",
-                source="tool.registry",
-                details={"tool_name": name},
-                flatten_details=True,
+            return str(error_envelope(
+                code="tool.not_found",
+                message=f"Unknown tool '{name}'",
             ))
         try:
             clean_args = {k: v for k, v in args.items() if k != "reasoning"}
-            result = await tool.func(**clean_args)
+            result = await asyncio.wait_for(
+                tool.func(**clean_args),
+                timeout=tool.timeout,
+            )
             return str(result)
+        except asyncio.TimeoutError:
+            return str(error_envelope(
+                code="tool.timeout",
+                message=f"Tool '{name}' timed out after {tool.timeout:.0f}s",
+                retryable=True,
+            ))
+        except TypeError as e:
+            return str(error_envelope(
+                code="tool.invalid_args",
+                message=f"Invalid arguments for '{name}': {e}",
+            ))
         except Exception as e:
-            return contract_dumps(error_envelope(
-                "tool.execution_failed",
-                f"Error executing {name}: {e}",
-                source="tool.registry",
-                details={"tool_name": name, "exception_type": type(e).__name__},
-                flatten_details=True,
+            return str(error_envelope(
+                code="tool.execution_error",
+                message=f"Error executing {name}: {e}",
+                retryable=True,
             ))
 
     def declarations(self, exclude: Optional[set] = None) -> list[dict]:
@@ -114,7 +158,8 @@ class ToolRegistry:
             if t.name in _exclude:
                 continue
             params = dict(t.parameters) if t.parameters else {"type": "object", "properties": {}}
-            if t.name not in _REASONING_EXEMPT_TOOLS:
+            is_exempt = t.reasoning_exempt or t.name in _REASONING_EXEMPT_TOOLS
+            if not is_exempt:
                 # Deep-copy properties and inject reasoning
                 props = dict(params.get("properties", {}))
                 props.update(_REASONING_PROPERTY)

@@ -13,8 +13,6 @@ backend_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 sys.path.insert(0, backend_path)
 
 from agent.world_state import WorldState, UserIntent, IntentParser, IntentAction, TargetType
-from agent.legacy_planner import ExecutionPlan, PlanBuilder, PlanTemplates
-from agent.planner import ExecutionStep, StepStatus
 from agent.task_planner import TaskPlanner
 from agent.verifier import ToolVerifier, get_verifier
 from agent.browser_intent_utils import is_browser_chrome_action, looks_like_browser_ui_shell_command
@@ -94,85 +92,6 @@ def test_ambiguity_detection():
     total = len(ambiguous_requests) + len(unambiguous_requests)
     print(f"  Result: {passed}/{total} passed")
     return passed == total
-
-
-def test_plan_templates():
-    """Test pre-built plan templates."""
-    print("\n=== Testing Plan Templates ===")
-    
-    # Test open_app template
-    plan = PlanTemplates.open_app("Spotify")
-    assert plan.task_summary == "Open Spotify"
-    assert len(plan.steps) == 1
-    assert plan.steps[0].tool == "open_app"
-    assert plan.steps[0].args["app_name"] == "Spotify"
-    assert plan.final_response == "Opening Spotify!"
-    print("  ✓ open_app template")
-    
-    # Test open_url template
-    plan = PlanTemplates.open_url("https://youtube.com")
-    assert plan.task_summary == "Open https://youtube.com"
-    assert plan.steps[0].tool == "open_url"
-    print("  ✓ open_url template")
-    
-    # Test search_web template
-    plan = PlanTemplates.search_web("lofi music")
-    assert "google.com/search" in plan.steps[0].args["url"]
-    assert "lofi" in plan.steps[0].args["url"]
-    print("  ✓ search_web template")
-    
-    # Test clarification template
-    plan = PlanTemplates.clarification_needed("What would you like me to delete?")
-    assert plan.needs_clarification
-    assert "delete" in plan.clarification_prompt
-    print("  ✓ clarification_needed template")
-    
-    print("  Result: 4/4 passed")
-    return True
-
-
-def test_plan_builder():
-    """Test fluent plan builder."""
-    print("\n=== Testing Plan Builder ===")
-    
-    plan = (PlanBuilder("Test multi-step task")
-        .add_step(
-            description="Step 1",
-            tool="open_app",
-            args={"app_name": "Safari"},
-            success_criteria="Safari is active"
-        )
-        .add_step(
-            description="Step 2",
-            tool="open_url",
-            args={"url": "https://youtube.com"},
-            depends_on=[1],
-            wait_after=1.0
-        )
-        .with_response("Done!")
-        .with_confidence(0.9)
-        .build())
-    
-    assert len(plan.steps) == 2
-    assert plan.steps[0].id == 1
-    assert plan.steps[1].id == 2
-    assert plan.steps[1].depends_on == [1]
-    assert plan.steps[1].wait_after == 1.0
-    assert plan.final_response == "Done!"
-    assert plan.confidence == 0.9
-    print("  ✓ Built 2-step plan with dependencies")
-    
-    # Test step status tracking
-    assert not plan.is_complete()
-    plan.mark_step_complete(1, "Success")
-    assert plan.steps[0].status == StepStatus.COMPLETED
-    assert plan.progress_percentage() == 50.0
-    plan.mark_step_complete(2, "Success")
-    assert plan.is_complete()
-    print("  ✓ Step status tracking works")
-    
-    print("  Result: 2/2 passed")
-    return True
 
 
 def test_tool_selector():
@@ -368,8 +287,6 @@ def main():
     results = []
     results.append(("Intent Parser", test_intent_parser()))
     results.append(("Ambiguity Detection", test_ambiguity_detection()))
-    results.append(("Plan Templates", test_plan_templates()))
-    results.append(("Plan Builder", test_plan_builder()))
     results.append(("Tool Selector", test_tool_selector()))
     results.append(("Browser Chrome Actions", test_browser_chrome_action_detection()))
     results.append(("Verifier", test_verifier()))

@@ -16,8 +16,7 @@ import time
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "backend"))
 
-from agent.legacy_planner import PlanBuilder
-from agent.planner import Milestone, MilestonePlan, StepStatus
+from agent.planner import ExecutionStep, Milestone, MilestonePlan, StepStatus
 from agent.task_planner import TaskPlanner
 from agent.core_v2 import MoonwalkAgentV2, PendingPlanState
 from agent.memory import WorkingMemory
@@ -424,88 +423,6 @@ def test_plan_tool_contract_requires_supported_hints():
 
     assert enforced.needs_clarification is True
     assert "run_shell" in enforced.clarification_prompt
-
-
-def test_planner_preflight_contracts():
-    planner = TaskPlanner(provider=None, tool_registry=tool_registry)
-
-    alias_plan = (
-        PlanBuilder("Alias contract")
-        .add_step("Respond", "send_response", {"response_text": "ok"})
-        .build()
-    )
-    ok, err = planner._preflight_validate_plan(alias_plan)
-    assert ok, err
-    assert alias_plan.steps[0].args["message"] == "ok"
-    assert "response_text" not in alias_plan.steps[0].args
-
-    legacy_plan = (
-        PlanBuilder("Legacy replace arg")
-        .add_step("Read file", "read_file", {"path": "a.py"})
-        .add_step(
-            "Patch file",
-            "replace_in_file",
-            {"path": "a.py", "old_text": "a", "new_text": "b", "global": True},
-        )
-        .build()
-    )
-    ok, err = planner._preflight_validate_plan(legacy_plan)
-    assert ok, err
-    assert "global" not in legacy_plan.steps[1].args
-
-    invalid_plan = (
-        PlanBuilder("Unknown tool")
-        .add_step("Run unknown", "run_applescript", {"script": "display dialog \"x\""})
-        .build()
-    )
-    ok, err = planner._preflight_validate_plan(invalid_plan)
-    assert not ok
-    assert "unknown tool 'run_applescript'" in err
-
-    missing_browser_baseline = (
-        PlanBuilder("Click by browser ref")
-        .add_step("Click submit", "browser_click_ref", {"ref_id": "mw_12"})
-        .build()
-    )
-    ok, err = planner._preflight_validate_plan(missing_browser_baseline)
-    assert ok, err
-    assert missing_browser_baseline.steps[0].tool == "browser_snapshot"
-    assert missing_browser_baseline.steps[1].tool == "browser_click_ref"
-
-    missing_read_before_replace = (
-        PlanBuilder("Patch without read")
-        .add_step("Replace value", "replace_in_file", {"path": "app.py", "old_text": "a", "new_text": "b"})
-        .build()
-    )
-    ok, err = planner._preflight_validate_plan(missing_read_before_replace)
-    assert ok, err
-    assert missing_read_before_replace.steps[0].tool == "read_file"
-    assert missing_read_before_replace.steps[1].tool == "replace_in_file"
-
-    research_single_step = (
-        PlanBuilder("Research flats in Egham, UK")
-        .add_step("Search for flats", "web_search", {"query": "flats in Egham UK"})
-        .build()
-    )
-    ok, err = planner._preflight_validate_plan(
-        research_single_step,
-        user_request="can you research uk flats in egham",
-    )
-    assert ok, err
-    repaired_tools = [s.tool for s in research_single_step.steps]
-    assert repaired_tools[0] == "web_search"
-    assert "browser_read_page" in repaired_tools
-    assert len(repaired_tools) >= 2
-
-    noisy_query_intent = planner.intent_parser.parse(
-        "research all UK housing and create a detailed google document about it",
-        WorldState(active_app="Google Chrome"),
-    )
-    derived_query = planner.template_registry._derive_search_query(
-        "research all UK housing and create a detailed google document about it",
-        noisy_query_intent,
-    )
-    assert derived_query.lower() == "all uk housing"
 
 
 def test_research_document_template_bypass():
@@ -1282,18 +1199,14 @@ async def test_get_web_information_degraded_route_uses_background_for_explicit_u
 
 async def test_execute_step_defers_research_commit_until_verification_success():
     agent = MoonwalkAgentV2(use_planning=False, persist=False)
-    step = (
-        PlanBuilder("Summarize page")
-        .add_step(
-            "Summarize page",
-            "get_web_information",
-            {
-                "url": "https://www.cih.org/knowledge-hub/uk-housing-review/",
-                "target_type": "page_summary",
-            },
-        )
-        .build()
-        .steps[0]
+    step = ExecutionStep(
+        id=1,
+        description="Summarize page",
+        tool="get_web_information",
+        args={
+            "url": "https://www.cih.org/knowledge-hub/uk-housing-review/",
+            "target_type": "page_summary",
+        },
     )
 
     original_execute = tool_registry.execute
@@ -1337,18 +1250,14 @@ async def test_execute_step_defers_research_commit_until_verification_success():
         assert len(actions) == 1
         assert actions[-1].success is False
 
-        step = (
-            PlanBuilder("Summarize page")
-            .add_step(
-                "Summarize page",
-                "get_web_information",
-                {
-                    "url": "https://www.cih.org/knowledge-hub/uk-housing-review/",
-                    "target_type": "page_summary",
-                },
-            )
-            .build()
-            .steps[0]
+        step = ExecutionStep(
+            id=1,
+            description="Summarize page",
+            tool="get_web_information",
+            args={
+                "url": "https://www.cih.org/knowledge-hub/uk-housing-review/",
+                "target_type": "page_summary",
+            },
         )
         agent.verifier.verify = _verify_success
         ok = await agent._execute_step(step, WorldState(active_app="Google Chrome"), ws_callback=None)
@@ -1365,11 +1274,11 @@ async def test_execute_step_defers_research_commit_until_verification_success():
 def test_execute_step_uses_conservative_vision_recovery_for_ui_failure():
     async def run():
         agent = MoonwalkAgentV2(use_planning=False, persist=False)
-        step = (
-            PlanBuilder("Click compose")
-            .add_step("Click compose", "browser_click_match", {"query": "Compose"})
-            .build()
-            .steps[0]
+        step = ExecutionStep(
+            id=1,
+            description="Click compose",
+            tool="browser_click_match",
+            args={"query": "Compose"},
         )
 
         original_execute = tool_registry.execute
@@ -1461,43 +1370,6 @@ class _FakeProvider:
 
     async def is_available(self):
         return True
-
-
-async def test_research_document_synthesis_from_snippets():
-    planner = TaskPlanner(provider=None, tool_registry=tool_registry)
-    plan = (
-        PlanBuilder("Research UK housing systems and write a document")
-        .add_step("Read page", "browser_read_page", {"query": "housing systems UK"})
-        .add_step("Create doc", "gdocs_create", {"title": "UK Housing Systems"})
-        .build()
-    )
-    ok, err = planner._preflight_validate_plan(
-        plan,
-        user_request="do research on all of the housing systems within the UK and write a document about it",
-    )
-    assert ok, err
-
-    agent = MoonwalkAgentV2(use_planning=False, persist=False)
-    step_results = {
-        1: json.dumps(
-            {
-                "url": "https://example.com/uk-housing",
-                "title": "Housing in the United Kingdom",
-                "content": (
-                    "Social housing is provided by councils and housing associations. "
-                    "Private renting has grown, and owner-occupation remains a core tenure."
-                ),
-            }
-        )
-    }
-    snippets = agent._collect_research_snippets(step_results)
-    synthesized = await agent._synthesize_research_body(
-        provider=_FakeProvider(),
-        user_text="do research on all of the housing systems within the UK and write a document about it",
-        task_summary=plan.task_summary,
-        snippets=snippets,
-    )
-    assert "Housing Systems in the UK" in synthesized
 
 
 def test_non_research_document_body_synthesis_from_title():
@@ -1632,11 +1504,11 @@ def test_pending_plan_staleness_rules():
 
 async def test_execute_step_handles_await_reply_payload():
     agent = MoonwalkAgentV2(use_planning=False, persist=False)
-    step = (
-        PlanBuilder("Pause for approval")
-        .add_step("Ask for confirmation", "await_reply", {"message": "Proceed?"})
-        .build()
-        .steps[0]
+    step = ExecutionStep(
+        id=1,
+        description="Ask for confirmation",
+        tool="await_reply",
+        args={"message": "Proceed?"},
     )
 
     ok = await agent._execute_step(
@@ -1799,11 +1671,11 @@ async def test_await_reply_blocks_execution():
 async def test_browser_read_page_context_recovery():
     agent = MoonwalkAgentV2(use_planning=False, persist=False)
     agent._last_opened_url = "https://www.google.com/search?q=uk+housing"
-    step = (
-        PlanBuilder("Read page")
-        .add_step("Read page", "browser_read_page", {"query": "uk housing"})
-        .build()
-        .steps[0]
+    step = ExecutionStep(
+        id=1,
+        description="Read page",
+        tool="browser_read_page",
+        args={"query": "uk housing"},
     )
 
     calls = []
@@ -1836,11 +1708,11 @@ async def test_browser_read_page_context_recovery():
 async def test_extract_structured_data_context_recovery():
     agent = MoonwalkAgentV2(use_planning=False, persist=False)
     agent._last_opened_url = "https://www.google.com/search?q=uk+housing"
-    step = (
-        PlanBuilder("Extract results")
-        .add_step("Extract results", "extract_structured_data", {"item_type": "results"})
-        .build()
-        .steps[0]
+    step = ExecutionStep(
+        id=1,
+        description="Extract results",
+        tool="extract_structured_data",
+        args={"item_type": "results"},
     )
 
     calls = []

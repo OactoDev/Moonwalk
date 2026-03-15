@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Tuple
 from providers.gemini import GeminiProvider
 
 
-_FLASH_TIMEOUT_SECONDS = 10.0
+_FLASH_TIMEOUT_SECONDS = 14.0
 _provider_cache: Dict[Tuple[str, str], GeminiProvider] = {}
 
 

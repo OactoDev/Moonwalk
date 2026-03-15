@@ -16,6 +16,21 @@ def _domain(url: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+_SEARCH_RESULT_HOSTS: frozenset[str] = frozenset({
+    "google.com", "bing.com", "duckduckgo.com", "search.yahoo.com",
+})
+
+
+def _is_search_results_url(url: str) -> bool:
+    if not url:
+        return False
+    host = _domain(url)
+    if host not in _SEARCH_RESULT_HOSTS:
+        return False
+    lowered = url.lower()
+    return "/search" in lowered or "q=" in lowered
+
+
 def decide_web_route(
     *,
     target_type: str,
@@ -51,9 +66,18 @@ def decide_web_route(
                 "confidence": 0.98,
                 "policy": "deterministic-web-policy",
             }
+        # When browser is connected, open the URL in the live browser so
+        # the user can see the navigation happen in real-time.
+        if live_browser_connected:
+            return {
+                "route": "browser_aci",
+                "reason": "Live browser connected — opening URL visibly instead of background fetch.",
+                "confidence": 0.94,
+                "policy": "deterministic-web-policy",
+            }
         return {
             "route": "background_fetch",
-            "reason": "Explicit URLs default to direct background reads.",
+            "reason": "No live browser — explicit URLs fall back to background reads.",
             "confidence": 0.95,
             "policy": "deterministic-web-policy",
         }
@@ -68,26 +92,35 @@ def decide_web_route(
         }
 
     if target_type == "search_results":
+        # When browser is connected, do live Google search so the user sees it
+        if live_browser_connected:
+            return {
+                "route": "browser_aci",
+                "reason": "Live browser connected — searching visibly in the browser.",
+                "confidence": 0.93,
+                "policy": "deterministic-web-policy",
+            }
         return {
             "route": "background_fetch",
-            "reason": "Search results default to background search for lower latency.",
+            "reason": "No live browser — search results via background search.",
             "confidence": 0.93,
             "policy": "deterministic-web-policy",
         }
 
     browser_apps = {"google chrome", "chrome", "safari", "arc", "brave", "brave browser", "firefox", "edge", "microsoft edge"}
-    if live_browser_connected and active_app in browser_apps and target_type in {"page_summary", "page_content", "structured_data"}:
+
+    # When browser is active and on a search page, boost confidence for ACI
+    _is_serp = _is_search_results_url(current_url) if current_url else False
+    if (
+        live_browser_connected
+        and active_app in browser_apps
+        and target_type in {"page_summary", "page_content", "structured_data"}
+        and _is_serp
+    ):
         return {
             "route": "browser_aci",
-            "reason": "A live browser is frontmost, so research should use the Chrome extension path.",
-            "confidence": 0.9,
-            "policy": "deterministic-web-policy",
-        }
-    if live_browser_connected and current_url and target_type in {"page_summary", "page_content", "structured_data"}:
-        return {
-            "route": "browser_aci",
-            "reason": "A live browser bridge is connected, so research should use the Chrome extension path.",
-            "confidence": 0.82,
+            "reason": "Browser is on a live search-results page; use ACI to extract and follow results.",
+            "confidence": 0.97,
             "policy": "deterministic-web-policy",
         }
 
@@ -101,9 +134,18 @@ def decide_web_route(
             "policy": "deterministic-web-policy",
         }
 
+    # ── Default: prefer live browser when connected ──
+    if live_browser_connected:
+        return {
+            "route": "browser_aci",
+            "reason": "Live browser connected — routing through visible browser for real-time feedback.",
+            "confidence": 0.90,
+            "policy": "deterministic-web-policy",
+        }
+
     return {
         "route": "background_fetch",
-        "reason": "Plain research queries default to deterministic background search and read.",
+        "reason": "No live browser connected — using background search and read.",
         "confidence": 0.9,
         "policy": "deterministic-web-policy",
     }

@@ -53,20 +53,17 @@ async def _require_snapshot(session_id: str = "", timeout: float = 1.5):
     if snapshot:
         return snapshot, ""
 
-    started = time.time()
-    while time.time() - started < max(0.0, timeout):
-        await asyncio.sleep(0.1)
-        snapshot = _lookup_snapshot(session_id)
-        if snapshot:
-            return snapshot, ""
+    # Use event-driven wait instead of polling
+    snapshot_obj = await browser_bridge.wait_for_snapshot(
+        session_id=session_id, min_generation=0, timeout=max(0.05, timeout)
+    )
+    if snapshot_obj:
+        return snapshot_obj, ""
 
-    snapshot = _lookup_snapshot(session_id)
-    if not snapshot:
-        return None, (
-            "ERROR: No active browser snapshot is available. The Chrome extension bridge "
-            "must connect and publish a page snapshot before browser ref tools can be used."
-        )
-    return snapshot, ""
+    return None, (
+        "ERROR: No active browser snapshot is available. The Chrome extension bridge "
+        "must connect and publish a page snapshot before browser ref tools can be used."
+    )
 
 
 def _resolve_element(ref_id: str, session_id: str = ""):
@@ -762,15 +759,8 @@ async def _queue_browser_action(action: str, ref_id: str, session_id: str = "", 
         }, ensure_ascii=False)
 
     # Wait for the action result and fresh snapshot
-    started = time.time()
     action_timeout_s = timeout
-    action_result = None
-    
-    while time.time() - started < action_timeout_s:
-        action_result = browser_bridge.latest_action_result(result.action_id)
-        if action_result:
-            break
-        await asyncio.sleep(0.1)
+    action_result = await browser_bridge.wait_for_result(result.action_id, timeout=action_timeout_s)
         
     if not action_result:
         # Timeout waiting for action execution
@@ -793,8 +783,10 @@ async def _queue_browser_action(action: str, ref_id: str, session_id: str = "", 
 
     # Wait briefly for a fresh snapshot after successful action
     if action_result.ok:
-        await asyncio.sleep(0.2)
-        fresh_snapshot = browser_store.get_snapshot(resolved_session_id)
+        pre_gen = action_result.pre_generation or 0
+        fresh_snapshot = await browser_bridge.wait_for_snapshot(
+            session_id=resolved_session_id, min_generation=pre_gen, timeout=0.5
+        )
         post_gen = fresh_snapshot.generation if fresh_snapshot else action_result.post_generation
     else:
         post_gen = action_result.post_generation
@@ -934,19 +926,18 @@ async def browser_refresh_refs(session_id: str = "", timeout: float = 2.0) -> st
         )
         queued = browser_bridge.queue_action(refresh_request)
         if queued.ok:
-            started = time.time()
-            while time.time() - started < max(0.1, timeout):
-                current = browser_store.get_snapshot(resolved_session_id)
-                if current:
-                    return json.dumps({
-                        "ok": True,
-                        "session_id": current.session_id or resolved_session_id,
-                        "generation": current.generation,
-                        "elements": len(current.elements),
-                        "message": "Browser snapshot bootstrapped from extension.",
-                        **_snapshot_health(current),
-                    }, ensure_ascii=False)
-                await asyncio.sleep(0.1)
+            current = await browser_bridge.wait_for_snapshot(
+                session_id=resolved_session_id, min_generation=0, timeout=max(0.1, timeout)
+            )
+            if current:
+                return json.dumps({
+                    "ok": True,
+                    "session_id": current.session_id or resolved_session_id,
+                    "generation": current.generation,
+                    "elements": len(current.elements),
+                    "message": "Browser snapshot bootstrapped from extension.",
+                    **_snapshot_health(current),
+                }, ensure_ascii=False)
         return _error_payload(
             "ERROR: No active browser snapshot is available. The Chrome extension bridge must publish a snapshot first.",
             error_code="no_snapshot",
@@ -958,21 +949,22 @@ async def browser_refresh_refs(session_id: str = "", timeout: float = 2.0) -> st
         refresh_request = ActionRequest(action="refresh_snapshot", ref_id="", session_id=snapshot.session_id, timeout=timeout)
         queued = browser_bridge.queue_action(refresh_request)
         if queued.ok:
-            started = time.time()
-            while time.time() - started < max(0.1, timeout):
-                current = browser_store.get_snapshot(snapshot.session_id)
-                if current and current.generation != previous_generation:
-                    snapshot = current
-                    return json.dumps({
-                        "ok": True,
-                        "session_id": snapshot.session_id,
-                        "generation": snapshot.generation,
-                        "elements": len(snapshot.elements),
-                        "message": "Browser snapshot refreshed from extension.",
-                        **_snapshot_health(snapshot),
-                    }, ensure_ascii=False)
-                await asyncio.sleep(0.1)
-            snapshot = browser_store.get_snapshot(snapshot.session_id) or snapshot
+            current = await browser_bridge.wait_for_snapshot(
+                session_id=snapshot.session_id,
+                min_generation=previous_generation,
+                timeout=max(0.1, timeout),
+            )
+            if current and current.generation != previous_generation:
+                snapshot = current
+                return json.dumps({
+                    "ok": True,
+                    "session_id": snapshot.session_id,
+                    "generation": snapshot.generation,
+                    "elements": len(snapshot.elements),
+                    "message": "Browser snapshot refreshed from extension.",
+                    **_snapshot_health(snapshot),
+                }, ensure_ascii=False)
+            snapshot = current or browser_store.get_snapshot(snapshot.session_id) or snapshot
     return json.dumps({
         "ok": True,
         "session_id": snapshot.session_id,
@@ -1057,34 +1049,34 @@ async def browser_scroll(direction: str = "down", amount: str = "page", session_
         )
 
     # Wait for the scroll action result and fresh snapshot
-    started = time.time()
     timeout_s = 3.0
-    while time.time() - started < timeout_s:
-        action_result = browser_bridge.latest_action_result(result.action_id)
-        if action_result:
-            # Also wait briefly for the fresh snapshot
-            await asyncio.sleep(0.2)
-            fresh_snapshot = browser_store.get_snapshot(resolved_session_id)
-            vp = fresh_snapshot.viewport if fresh_snapshot else snapshot.viewport
-            page_height = getattr(vp, 'page_height', 0) or getattr(vp, 'scroll_height', 0) or 0
-            scroll_y = vp.scroll_y
-            viewport_height = vp.height
-            at_bottom = (scroll_y + viewport_height) >= (page_height - 5) if page_height > 0 else False
+    action_result = await browser_bridge.wait_for_result(result.action_id, timeout=timeout_s)
+    if action_result:
+        # Wait briefly for fresh snapshot after scroll
+        fresh_snapshot = await browser_bridge.wait_for_snapshot(
+            session_id=resolved_session_id,
+            min_generation=snapshot.generation,
+            timeout=0.5,
+        )
+        vp = fresh_snapshot.viewport if fresh_snapshot else snapshot.viewport
+        page_height = getattr(vp, 'page_height', 0) or getattr(vp, 'scroll_height', 0) or 0
+        scroll_y = vp.scroll_y
+        viewport_height = vp.height
+        at_bottom = (scroll_y + viewport_height) >= (page_height - 5) if page_height > 0 else False
 
-            return json.dumps({
-                "ok": True,
-                "direction": direction,
-                "amount": amount,
-                "scroll_y": scroll_y,
-                "page_height": page_height,
-                "viewport_height": viewport_height,
-                "at_bottom": at_bottom,
-                "at_top": scroll_y <= 0,
-                "message": f"Scrolled {direction} by {amount}. Position: {scroll_y}/{page_height}px."
-                           + (" Reached bottom of page." if at_bottom else ""),
-                "generation": fresh_snapshot.generation if fresh_snapshot else snapshot.generation,
-            }, ensure_ascii=False)
-        await asyncio.sleep(0.1)
+        return json.dumps({
+            "ok": True,
+            "direction": direction,
+            "amount": amount,
+            "scroll_y": scroll_y,
+            "page_height": page_height,
+            "viewport_height": viewport_height,
+            "at_bottom": at_bottom,
+            "at_top": scroll_y <= 0,
+            "message": f"Scrolled {direction} by {amount}. Position: {scroll_y}/{page_height}px."
+                       + (" Reached bottom of page." if at_bottom else ""),
+            "generation": fresh_snapshot.generation if fresh_snapshot else snapshot.generation,
+        }, ensure_ascii=False)
 
     # Timeout — return best-effort from viewport data
     fresh_snapshot = browser_store.get_snapshot(resolved_session_id) or snapshot

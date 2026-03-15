@@ -782,10 +782,10 @@ function ensureClickPointerStyles() {
       width: 12px;
       height: 12px;
       border-radius: 50%;
-      background: rgba(99, 102, 241, 1);
+      background: rgba(0, 122, 255, 1);
       box-shadow:
         0 0 0 2px rgba(255,255,255,0.9),
-        0 0 12px 0 rgba(99, 102, 241, 0.6);
+        0 0 12px 0 rgba(0, 122, 255, 0.6);
       transform: translate(-50%, -50%) scale(0);
       transform-origin: center;
       animation: mw-ptr-intro 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
@@ -799,7 +799,7 @@ function ensureClickPointerStyles() {
       width: 32px;
       height: 32px;
       border-radius: 50%;
-      border: 1.5px solid rgba(99, 102, 241, 0.55);
+      border: 1.5px solid rgba(175, 82, 222, 0.55);
       transform: translate(-50%, -50%) scale(0.7);
       transform-origin: center;
       animation: mw-ptr-ring-expand 1.1s ease-out infinite;
@@ -809,7 +809,7 @@ function ensureClickPointerStyles() {
       width: 20px;
       height: 20px;
       border-radius: 50%;
-      background: rgba(99, 102, 241, 0.45);
+      background: rgba(0, 122, 255, 0.45);
       transform: translate(-50%, -50%) scale(0);
       transform-origin: center;
       opacity: 0;
@@ -896,14 +896,24 @@ function ensureHighlightStyles() {
   const style = document.createElement("style");
   style.id = HIGHLIGHT_STYLE_ID;
   style.textContent = `
-    /* ── Keyframes ── */
-    @keyframes mw-scan {
-      0%   { background-position: -150% 0; }
-      100% { background-position: 250% 0; }
+    /* ── Houdini custom property for animated conic angle (Chrome 85+) ── */
+    @property --mw-angle {
+      syntax: '<angle>';
+      initial-value: 0deg;
+      inherits: false;
     }
-    @keyframes mw-pulse-border {
-      0%, 100% { opacity: 0.5; }
-      50%       { opacity: 1; }
+
+    /* ── Keyframes ── */
+    @keyframes mw-rotate-gradient {
+      to { --mw-angle: 360deg; }
+    }
+    @keyframes mw-gradient-flow {
+      0%   { background-position: 0% 50%; }
+      100% { background-position: 300% 50%; }
+    }
+    @keyframes mw-sweep {
+      0%   { left: -150%; }
+      100% { left: 200%; }
     }
     @keyframes mw-intro {
       0%   { opacity: 0; transform: scaleY(0.6) scaleX(0.97); }
@@ -914,96 +924,224 @@ function ensureHighlightStyles() {
       0%   { opacity: 1; transform: scale(1); }
       100% { opacity: 0; transform: scaleY(0.7) scaleX(0.98); }
     }
+    @keyframes mw-glow-pulse {
+      0%, 100% {
+        box-shadow:
+          0 0 0 0 transparent,
+          0 8px 24px -4px rgba(0, 122, 255, 0.12);
+      }
+      50% {
+        box-shadow:
+          0 0 20px 2px rgba(175, 82, 222, 0.15),
+          0 12px 32px -4px rgba(0, 122, 255, 0.18);
+      }
+    }
 
-    /* ── Shared base: position:relative so ::before can use inset ── */
+    /* ── Shared base ── */
     .mw-hl, .mw-hl-text {
       position: relative !important;
       isolation: isolate !important;
     }
 
-    /* ── Pseudo-overlay (covers element + 5px padding, never shifts layout) ── */
-    .mw-hl::before, .mw-hl-text::before {
+    /* ===========================================================
+       ELEMENT / DIV HIGHLIGHT — Spinning conic-gradient border
+       =========================================================== */
+    .mw-hl::before {
       content: '' !important;
       position: absolute !important;
-      inset: -5px -6px !important;
-      border-radius: 8px !important;
+      inset: -3px !important;
+      border-radius: 12px !important;
       pointer-events: none !important;
       z-index: 2147483640 !important;
       transform-origin: center center !important;
-      /* background + animation set per-phase below */
+      opacity: 0 !important;
+      background: conic-gradient(
+        from var(--mw-angle),
+        transparent 0%,
+        transparent 55%,
+        #af52de 75%,
+        #007aff 95%,
+        transparent 100%
+      ) !important;
+      /* Mask trick: gradient only visible in the 2px ring (padding area) */
+      -webkit-mask:
+        linear-gradient(#fff 0 0) content-box,
+        linear-gradient(#fff 0 0) !important;
+      -webkit-mask-composite: xor !important;
+      mask-composite: exclude !important;
+      padding: 2px !important;
     }
 
-    /* ── Phase: intro ── */
+    /* Phase: intro */
     .mw-hl--intro::before {
-      background: linear-gradient(
-        90deg,
-        transparent 0%,
-        rgba(99, 102, 241, 0.18) 40%,
-        rgba(99, 102, 241, 0.30) 55%,
-        rgba(99, 102, 241, 0.18) 70%,
-        transparent 100%
-      ) !important;
-      background-size: 200% 100% !important;
-      box-shadow: inset 0 0 0 1.5px rgba(99, 102, 241, 0.30) !important;
       animation: mw-intro 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) forwards !important;
     }
-    .mw-hl-text--intro::before {
-      background: linear-gradient(
-        90deg,
-        transparent 0%,
-        rgba(245, 158, 11, 0.15) 40%,
-        rgba(245, 158, 11, 0.26) 55%,
-        rgba(245, 158, 11, 0.15) 70%,
-        transparent 100%
-      ) !important;
-      background-size: 200% 100% !important;
-      box-shadow: inset 0 0 0 1.5px rgba(245, 158, 11, 0.28) !important;
-      animation: mw-intro 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) forwards !important;
+    .mw-hl--intro {
+      transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1),
+                  box-shadow 0.4s ease !important;
     }
 
-    /* ── Phase: reading (looping scanner + pulsing border) ── */
+    /* Phase: reading — spinning border + lift + glow */
     .mw-hl--reading::before {
-      background: linear-gradient(
-        90deg,
-        transparent    0%,
-        rgba(99, 102, 241, 0.06) 20%,
-        rgba(99, 102, 241, 0.22) 45%,
-        rgba(99, 102, 241, 0.36) 50%,
-        rgba(99, 102, 241, 0.22) 55%,
-        rgba(99, 102, 241, 0.06) 80%,
-        transparent  100%
-      ) !important;
-      background-size: 220% 100% !important;
-      box-shadow:
-        inset 0 0 0 1.5px rgba(99, 102, 241, 0.28),
-        0 0 12px 0 rgba(99, 102, 241, 0.10) !important;
-      animation:
-        mw-scan 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite,
-        mw-pulse-border 2s ease-in-out infinite !important;
+      opacity: 1 !important;
+      animation: mw-rotate-gradient 3s linear infinite !important;
     }
-    .mw-hl-text--reading::before {
-      background: linear-gradient(
-        90deg,
-        transparent    0%,
-        rgba(245, 158, 11, 0.05) 20%,
-        rgba(245, 158, 11, 0.18) 45%,
-        rgba(245, 158, 11, 0.30) 50%,
-        rgba(245, 158, 11, 0.18) 55%,
-        rgba(245, 158, 11, 0.05) 80%,
-        transparent  100%
-      ) !important;
-      background-size: 220% 100% !important;
-      box-shadow:
-        inset 0 0 0 1.5px rgba(245, 158, 11, 0.25),
-        0 0 12px 0 rgba(245, 158, 11, 0.08) !important;
-      animation:
-        mw-scan 2s cubic-bezier(0.4, 0, 0.6, 1) infinite,
-        mw-pulse-border 2.4s ease-in-out infinite !important;
+    .mw-hl--reading {
+      transform: translateY(-3px) !important;
+      animation: mw-glow-pulse 3s ease-in-out infinite !important;
+      transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1) !important;
     }
 
-    /* ── Phase: outro ── */
-    .mw-hl--outro::before, .mw-hl-text--outro::before {
+    /* Phase: outro */
+    .mw-hl--outro::before {
       animation: mw-outro 0.5s ease-in forwards !important;
+    }
+    .mw-hl--outro {
+      transform: translateY(0) !important;
+      box-shadow: none !important;
+      transition: transform 0.5s ease, box-shadow 0.5s ease !important;
+    }
+
+    /* ===========================================================
+       TEXT HIGHLIGHT — Fluid gradient behind text
+       =========================================================== */
+    .mw-hl-text::before {
+      content: '' !important;
+      position: absolute !important;
+      inset: -2px -5px !important;
+      border-radius: 6px !important;
+      pointer-events: none !important;
+      z-index: -1 !important;
+      transform-origin: center center !important;
+      opacity: 0 !important;
+      background: linear-gradient(
+        90deg, #007aff, #af52de, #ff2d55, #007aff
+      ) !important;
+      background-size: 300% 100% !important;
+    }
+
+    /* Phase: intro */
+    .mw-hl-text--intro::before {
+      animation: mw-intro 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) forwards !important;
+    }
+
+    /* Phase: reading — flowing gradient + white text */
+    .mw-hl-text--reading::before {
+      opacity: 1 !important;
+      animation: mw-gradient-flow 3s linear infinite !important;
+    }
+    .mw-hl-text--reading {
+      color: #ffffff !important;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.15) !important;
+      transition: color 0.4s ease !important;
+    }
+
+    /* Phase: outro */
+    .mw-hl-text--outro::before {
+      animation: mw-outro 0.5s ease-in forwards !important;
+    }
+    .mw-hl-text--outro {
+      color: inherit !important;
+      text-shadow: none !important;
+    }
+
+    /* ===========================================================
+       MEDIA — Glass sweep + subtle scale
+       =========================================================== */
+    .mw-hl--reading img,
+    .mw-hl--reading video {
+      transform: scale(1.03) !important;
+      transition: transform 2s ease !important;
+    }
+    .mw-hl--outro img,
+    .mw-hl--outro video {
+      transform: scale(1) !important;
+    }
+
+    .mw-media-sweep {
+      position: absolute !important;
+      top: 0 !important;
+      left: -150% !important;
+      width: 50% !important;
+      height: 100% !important;
+      background: linear-gradient(
+        to right,
+        rgba(255,255,255,0),
+        rgba(255,255,255,0.55),
+        rgba(255,255,255,0)
+      ) !important;
+      transform: skewX(-25deg) !important;
+      z-index: 2147483641 !important;
+      pointer-events: none !important;
+      animation: mw-sweep 2.5s cubic-bezier(0.4, 0, 0.2, 1) infinite !important;
+    }
+
+    /* ===========================================================
+       PAGE-WIDE SCANNING MODE — Edge borders + progress beam
+       =========================================================== */
+    @keyframes mw-scan-beam {
+      0%   { top: -6px; opacity: 0; }
+      5%   { opacity: 1; }
+      95%  { opacity: 1; }
+      100% { top: 100%; opacity: 0; }
+    }
+    @keyframes mw-scan-border-pulse {
+      0%, 100% { opacity: 0.35; }
+      50%      { opacity: 0.7; }
+    }
+
+    .mw-scanning-frame {
+      position: fixed !important;
+      inset: 0 !important;
+      z-index: 2147483646 !important;
+      pointer-events: none !important;
+      border: 2px solid transparent !important;
+      border-image: linear-gradient(
+        135deg, #007aff, #af52de, #ff2d55, #007aff
+      ) 1 !important;
+      animation: mw-scan-border-pulse 2s ease-in-out infinite !important;
+      transition: opacity 0.5s ease !important;
+    }
+
+    .mw-scanning-beam {
+      position: fixed !important;
+      left: 0 !important;
+      right: 0 !important;
+      height: 3px !important;
+      z-index: 2147483647 !important;
+      pointer-events: none !important;
+      background: linear-gradient(
+        90deg,
+        transparent 0%,
+        #007aff 15%,
+        #af52de 50%,
+        #007aff 85%,
+        transparent 100%
+      ) !important;
+      box-shadow: 0 0 12px 3px rgba(0, 122, 255, 0.4),
+                  0 0 30px 6px rgba(175, 82, 222, 0.15) !important;
+      animation: mw-scan-beam var(--mw-scan-duration, 3s)
+                 cubic-bezier(0.22, 0.61, 0.36, 1) forwards !important;
+    }
+
+    .mw-scanning-label {
+      position: fixed !important;
+      top: 10px !important;
+      right: 14px !important;
+      z-index: 2147483647 !important;
+      pointer-events: none !important;
+      font: 600 11px/1.2 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
+      color: rgba(255, 255, 255, 0.95) !important;
+      background: linear-gradient(135deg, rgba(0,122,255,0.7), rgba(175,82,222,0.7)) !important;
+      backdrop-filter: blur(16px) saturate(1.5) !important;
+      -webkit-backdrop-filter: blur(16px) saturate(1.5) !important;
+      padding: 5px 12px 5px 10px !important;
+      border-radius: 14px !important;
+      letter-spacing: 0.3px !important;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.15) !important;
+      opacity: 0 !important;
+      transform: translateY(-8px) !important;
+      animation: mw-intro 0.35s 0.1s cubic-bezier(0.34, 1.56, 0.64, 1) forwards !important;
     }
   `;
   (document.head || document.documentElement).appendChild(style);
@@ -1039,9 +1177,37 @@ function _applyHighlightLifecycle(el, baseCls, staggerMs, durationMs) {
   const outroDuration = 500; // ms — matches mw-outro animation
   const introToReading = 450; // ms — matches mw-intro duration
 
+  // Detect media elements for glass sweep injection
+  var mediaEls = [];
+  var tag = el.tagName.toLowerCase();
+  if (tag === "img" || tag === "video") {
+    mediaEls.push(el);
+  } else {
+    var innerMedia = el.querySelectorAll("img, video");
+    for (var i = 0; i < innerMedia.length; i++) {
+      if (isVisible(innerMedia[i])) mediaEls.push(innerMedia[i]);
+    }
+  }
+
   // 1. Add base + intro (staggered)
   setTimeout(function() {
     el.classList.add(baseCls, introPhase);
+
+    // Inject glass sweep overlays on media elements
+    var sweepOverlays = [];
+    for (var m = 0; m < mediaEls.length; m++) {
+      var media = mediaEls[m];
+      var parent = media.parentElement;
+      if (!parent) continue;
+      var pPos = window.getComputedStyle(parent).position;
+      if (pPos === "static") parent.style.position = "relative";
+      var hadOverflow = parent.style.overflow;
+      parent.style.overflow = "hidden";
+      var sweep = document.createElement("div");
+      sweep.className = "mw-media-sweep";
+      parent.appendChild(sweep);
+      sweepOverlays.push({ sweep: sweep, parent: parent, hadPosition: pPos, hadOverflow: hadOverflow });
+    }
 
     // 2. Transition to reading phase after intro completes
     setTimeout(function() {
@@ -1058,6 +1224,14 @@ function _applyHighlightLifecycle(el, baseCls, staggerMs, durationMs) {
       // 4. Clean up after outro animation completes
       setTimeout(function() {
         el.classList.remove(baseCls, outroPhase);
+        // Remove sweep overlays and restore parent styles
+        for (var s = 0; s < sweepOverlays.length; s++) {
+          sweepOverlays[s].sweep.remove();
+          if (sweepOverlays[s].hadPosition === "static") {
+            sweepOverlays[s].parent.style.position = "";
+          }
+          sweepOverlays[s].parent.style.overflow = sweepOverlays[s].hadOverflow || "";
+        }
       }, outroDuration + 50);
     }, totalAfterStart);
   }, staggerMs);
@@ -1100,6 +1274,77 @@ function highlightReadableContent(durationMs, overlayDetails) {
   }
 
   return highlighted.length;
+}
+
+
+// ── Page-wide AI scanning mode ──
+let _scanningCleanup = null;
+
+function startScanningMode(labelText, durationMs) {
+  stopScanningMode(); // clean up any previous
+  ensureHighlightStyles();
+  durationMs = Math.max(1500, Math.min(durationMs || 4000, 15000));
+
+  // 1. Edge frame
+  const frame = document.createElement("div");
+  frame.className = "mw-scanning-frame";
+  document.body.appendChild(frame);
+
+  // 2. Scan beam
+  const beam = document.createElement("div");
+  beam.className = "mw-scanning-beam";
+  beam.style.setProperty("--mw-scan-duration", durationMs + "ms");
+  document.body.appendChild(beam);
+
+  // 3. Label pill
+  const label = document.createElement("div");
+  label.className = "mw-scanning-label";
+  label.textContent = labelText || "AI analyzing page…";
+  document.body.appendChild(label);
+
+  // 4. Also cascade-highlight visible readable content
+  const readableNodes = document.querySelectorAll(READABLE_SELECTOR);
+  const highlighted = [];
+  for (const el of readableNodes) {
+    if (!isVisible(el) || !isInViewport(el)) continue;
+    if (!isReadableCandidate(el)) continue;
+    const stagger = highlighted.length * 80;
+    _applyHighlightLifecycle(el, "mw-hl-text", stagger, durationMs);
+    highlighted.push(el);
+    if (highlighted.length >= 20) break;
+  }
+
+  // Store cleanup
+  const cleanupTimer = setTimeout(function() {
+    stopScanningMode();
+  }, durationMs + 600);
+
+  _scanningCleanup = function() {
+    clearTimeout(cleanupTimer);
+    // Fade out frame
+    frame.style.opacity = "0";
+    beam.style.opacity = "0";
+    label.style.opacity = "0";
+    label.style.transform = "translateY(-8px)";
+    setTimeout(function() {
+      frame.remove();
+      beam.remove();
+      label.remove();
+    }, 500);
+    _scanningCleanup = null;
+  };
+
+  return highlighted.length;
+}
+
+function stopScanningMode() {
+  if (_scanningCleanup) {
+    _scanningCleanup();
+    _scanningCleanup = null;
+  }
+  // Also clean up any leftover elements
+  document.querySelectorAll(".mw-scanning-frame, .mw-scanning-beam, .mw-scanning-label")
+    .forEach(function(el) { el.remove(); });
 }
 
 const READABILITY_MIN_TEXT_CHARS = 200;
@@ -1405,6 +1650,19 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
       count = highlightReadableContent(duration, overlayDetails);
     }
     sendResponse?.({ ok: true, highlighted: count, overlayVisible: true });
+    return true;
+  }
+  // ── AI scanning mode — persistent page-wide visual while AI reads ──
+  if (message?.type === "moonwalk_scanning_start") {
+    const label = message.label || "AI analyzing page…";
+    const duration = Number(message.duration || 4000);
+    const count = startScanningMode(label, duration);
+    sendResponse?.({ ok: true, highlighted: count });
+    return true;
+  }
+  if (message?.type === "moonwalk_scanning_stop") {
+    stopScanningMode();
+    sendResponse?.({ ok: true });
     return true;
   }
   // ── Agent click pointer ──

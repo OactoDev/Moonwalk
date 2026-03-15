@@ -2,10 +2,6 @@
 Moonwalk — Task Planner V2
 ===========================
 Milestone-first task planner for the unified execution loop.
-
-The active runtime emits MilestonePlan objects only. Legacy step-plan
-compatibility lives in `agent.legacy_task_planner` and is not part of the
-live execution path.
 """
 
 import json
@@ -16,7 +12,6 @@ from functools import partial
 print = partial(print, flush=True)
 
 from agent.world_state import WorldState, UserIntent, IntentAction, TargetType, IntentParser, TaskGraph
-from agent.legacy_task_planner import LegacyTaskPlannerCompatMixin
 from agent.planner import Milestone, MilestonePlan, MilestoneStatus
 from agent.example_bank import ExampleBank
 from agent.template_registry import TemplateRegistry
@@ -103,7 +98,7 @@ Request: "Research UK rental market and create a document"
     }},
     {{
       "id": 2,
-      "goal": "Create a comprehensive Google Doc with synthesized findings",
+      "goal": "Create a comprehensive Google Doc with findings",
       "success_signal": "Google Doc URL returned with content written",
       "hint_tools": ["gdocs_create", "gdocs_append"],
       "depends_on": [1],
@@ -164,6 +159,32 @@ Request: "Open Spotify"
   "final_response": "Spotify is open."
 }}
 
+Request: "Message Chris on WhatsApp saying I'll be late"
+{{
+  "task_summary": "Send a WhatsApp message to Chris",
+  "needs_clarification": false,
+  "clarification_prompt": "",
+  "milestones": [
+    {{
+      "id": 1,
+      "goal": "Open WhatsApp, search for and open the chat with Chris",
+      "success_signal": "WhatsApp is open and Chris's chat conversation is visible",
+      "hint_tools": ["open_app", "click_ui", "type_in_field"],
+      "depends_on": [],
+      "deliverable_key": "chat_opened"
+    }},
+    {{
+      "id": 2,
+      "goal": "Type the message and send it to Chris",
+      "success_signal": "The message has been typed into the chat and sent",
+      "hint_tools": ["click_ui", "type_in_field", "type_text", "press_key"],
+      "depends_on": [1],
+      "deliverable_key": "message_sent"
+    }}
+  ],
+  "final_response": "Message sent to Chris on WhatsApp."
+}}
+
 Now create a milestone plan for the user's request. Output ONLY the JSON:"""
 
 
@@ -217,13 +238,11 @@ Error: {failure_reason}
 #  Task Planner Class
 # ═══════════════════════════════════════════════════════════════
 
-class TaskPlanner(LegacyTaskPlannerCompatMixin):
+class TaskPlanner:
     """
     Generates milestone plans from user requests.
 
-    The active runtime is milestone-only. Legacy step-plan compatibility is
-    inherited from `LegacyTaskPlannerCompatMixin` for tests and offline
-    validation only.
+    The active runtime is milestone-only.
     """
     
     def __init__(self, provider=None, tool_registry=None):
@@ -242,7 +261,6 @@ class TaskPlanner(LegacyTaskPlannerCompatMixin):
         
         # Cache for tool descriptions
         self._tool_descriptions_cache: Optional[str] = None
-        self._tool_contracts_cache: Optional[dict] = None
 
     def record_success(self, request: str, plan, intent: UserIntent):
         """Record a successful plan execution in the example bank for future learning."""
@@ -385,78 +403,6 @@ class TaskPlanner(LegacyTaskPlannerCompatMixin):
             source="milestone_media_shortcut",
         )
 
-    def _build_simple_intent_shortcut(
-        self,
-        user_request: str,
-        intent: UserIntent,
-        world_state: WorldState,
-        available_tools: Optional[List[str]] = None,
-    ) -> Optional[MilestonePlan]:
-        """
-        Fast-path shortcut for simple, unambiguous intents that map 1:1 to a single tool call.
-        Bypasses the LLM planning phase (saving 2-4 seconds) for commands like "open Spotify",
-        "lock screen", or "set volume to 50%".
-        """
-        if intent.ambiguous or intent.confidence < 0.8:
-            return None
-
-        allowed = set(available_tools or [])
-        summary = ""
-        goal = ""
-        signal = ""
-        hint_tool = ""
-        target = intent.target_value
-
-        # 1) Open Application
-        if intent.action == IntentAction.OPEN and intent.target_type == TargetType.APP and target:
-            if "open_app" not in allowed: return None
-            summary = f"Open {target}"
-            goal = f"Open the {target} application"
-            signal = f"The {target} application is running and active"
-            hint_tool = "open_app"
-
-        # 2) Open URL
-        elif intent.action == IntentAction.OPEN and intent.target_type == TargetType.URL and target:
-            if "open_url" not in allowed: return None
-            summary = f"Open {target}"
-            goal = f"Open {target} in the browser"
-            signal = "The requested URL is open"
-            hint_tool = "open_url"
-
-        # 3) System Control: Volume
-        elif intent.action == IntentAction.SET and intent.target_type == TargetType.SYSTEM_STATE and "volume" in (target or "").lower():
-            if "system_control" not in allowed: return None
-            summary = "Adjust system volume"
-            goal = f"Set system volume to requested level ({target})"
-            signal = "System volume is updated"
-            hint_tool = "system_control"
-
-        # 4) System Control: Lock / Sleep
-        elif intent.action == IntentAction.SYSTEM_COMMAND and target and target.lower() in ("lock", "sleep"):
-            if "system_control" not in allowed: return None
-            summary = f"{target.title()} the system"
-            goal = f"Execute the {target} command"
-            signal = "System command executed"
-            hint_tool = "system_control"
-
-        if not hint_tool:
-            return None
-
-        return MilestonePlan(
-            task_summary=summary,
-            milestones=[
-                Milestone(
-                    id=1,
-                    goal=goal,
-                    success_signal=signal,
-                    hint_tools=[hint_tool],
-                    deliverable_key="action_complete",
-                )
-            ],
-            final_response="Done.",
-            source="milestone_simple_intent_shortcut",
-        )
-
     def _looks_like_repeat_message_request(
         self,
         user_request: str,
@@ -549,11 +495,6 @@ class TaskPlanner(LegacyTaskPlannerCompatMixin):
         if media_shortcut is not None:
             print(f"[Planner] Direct media shortcut ({time.time() - t_start:.2f}s)")
             return media_shortcut
-
-        simple_intent_shortcut = self._build_simple_intent_shortcut(user_request, intent, world_state, available_tools)
-        if simple_intent_shortcut is not None:
-            print(f"[Planner] Simple intent shortcut ({time.time() - t_start:.2f}s)")
-            return simple_intent_shortcut
 
         skill_candidates = self.template_registry.get_skill_candidates(
             user_request=user_request,
@@ -714,11 +655,13 @@ class TaskPlanner(LegacyTaskPlannerCompatMixin):
 
         milestones = []
         for m_data in data.get("milestones", []):
+            raw_hints = m_data.get("hint_tools", [])
+            sanitized_hints = self._sanitize_hint_tools(raw_hints)
             milestones.append(Milestone(
                 id=m_data.get("id", len(milestones) + 1),
                 goal=m_data.get("goal", ""),
                 success_signal=m_data.get("success_signal", ""),
-                hint_tools=m_data.get("hint_tools", []),
+                hint_tools=sanitized_hints,
                 depends_on=m_data.get("depends_on", []),
                 deliverable_key=m_data.get("deliverable_key", ""),
             ))
@@ -729,6 +672,57 @@ class TaskPlanner(LegacyTaskPlannerCompatMixin):
             final_response=data.get("final_response", "Done!"),
             source="milestone_planner",
         )
+
+    # Map commonly hallucinated tool names to their real equivalents
+    _HALLUCINATED_TOOL_MAP: dict[str, list[str]] = {
+        "computer_interface": ["click_ui", "type_in_field", "get_ui_tree"],
+        "computer_control": ["click_ui", "type_in_field", "type_text", "press_key"],
+        "computer_interaction": ["click_ui", "type_in_field", "type_text"],
+        "open_application": ["open_app"],
+        "close_application": ["quit_app"],
+        "bash": ["run_shell"],
+        "terminal": ["run_shell"],
+        "shell": ["run_shell"],
+        "browser": ["open_url", "browser_read_page"],
+        "screenshot": ["read_screen"],
+        "search": ["get_web_information"],
+        "web_browse": ["open_url", "get_web_information"],
+        "keyboard": ["press_key", "type_text"],
+        "mouse": ["click_ui"],
+        "ui_interact": ["click_ui", "type_in_field"],
+        "desktop_interact": ["click_ui", "type_in_field", "get_ui_tree"],
+    }
+
+    def _sanitize_hint_tools(self, raw_hints: list) -> list[str]:
+        """Map hallucinated tool names to real ones and drop unknowns."""
+        available = set()
+        if self.tool_registry:
+            try:
+                available = {d["name"] for d in self.tool_registry.declarations()}
+            except Exception:
+                pass
+
+        sanitized: list[str] = []
+        seen: set[str] = set()
+        for hint in raw_hints or []:
+            tool_name = str(hint).strip()
+            if not tool_name:
+                continue
+            # Already a valid tool
+            if not available or tool_name in available:
+                if tool_name not in seen:
+                    sanitized.append(tool_name)
+                    seen.add(tool_name)
+                continue
+            # Try mapping hallucinated name → real tools
+            mapped = self._HALLUCINATED_TOOL_MAP.get(tool_name.lower(), [])
+            for real_tool in mapped:
+                if (not available or real_tool in available) and real_tool not in seen:
+                    sanitized.append(real_tool)
+                    seen.add(real_tool)
+            if not mapped:
+                print(f"[Planner] ⚠ Dropping unknown hint_tool '{tool_name}'")
+        return sanitized
 
     def _get_tool_category_summary(self, available_tools: Optional[List[str]] = None) -> str:
         """Build the filtered tool summary used by the milestone planner."""

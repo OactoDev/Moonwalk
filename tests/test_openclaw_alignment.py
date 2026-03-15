@@ -12,7 +12,6 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "backend"))
 
 from agent.core_v2 import MoonwalkAgentV2
-from agent.legacy_planner import PlanTemplates
 from agent.planner import Milestone, MilestonePlan
 from agent.task_planner import TaskPlanner
 from agent.verifier import ToolVerifier
@@ -49,25 +48,6 @@ def test_compound_task_bypasses_template_shortcuts():
     graph = planner.intent_parser.extract_task_graph(COMPOUND_MEDIA_REQUEST)
 
     assert planner._should_bypass_template_shortcuts(COMPOUND_MEDIA_REQUEST, graph) is True
-
-
-def test_preflight_rejects_open_app_only_plan_for_compound_media_task():
-    planner = TaskPlanner(provider=None, tool_registry=tool_registry)
-    graph = planner.intent_parser.extract_task_graph(COMPOUND_MEDIA_REQUEST)
-    plan = PlanTemplates.open_app("CapCut")
-
-    ok, err = planner._preflight_validate_plan(
-        plan,
-        user_request=COMPOUND_MEDIA_REQUEST,
-        task_graph=graph,
-    )
-
-    assert ok is False
-    assert (
-        "local source resolution" in err
-        or "await_reply" in err
-        or "under-specified" in err
-    )
 
 
 def test_should_use_milestones_for_compound_app_file_task():

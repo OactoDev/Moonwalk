@@ -1,14 +1,88 @@
 {
-  "name": "liquid-assistant",
-  "version": "0.1.0",
-  "description": "Electron liquid assistant overlay",
+  "name": "moonwalk",
+  "version": "1.0.0",
+  "description": "Moonwalk — AI Desktop Assistant",
+  "author": "Moonwalk",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "build": "electron-builder --mac",
+    "build:dmg": "electron-builder --mac dmg",
+    "build:dir": "electron-builder --mac dir",
+    "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
-    "electron": "^36.2.0",
     "katex": "^0.16.37",
     "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "electron": "^36.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.moonwalk.assistant",
+    "productName": "Moonwalk",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "node_modules/**/*",
+      "!node_modules/electron/**",
+      "!node_modules/electron-builder/**"
+    ],
+    "extraResources": [
+      {
+        "from": "backend",
+        "to": "backend",
+        "filter": [
+          "**/*",
+          "!__pycache__/**",
+          "!*.pyc",
+          "!.env"
+        ]
+      },
+      {
+        "from": "hey_moonwalk.ppn",
+        "to": "hey_moonwalk.ppn"
+      },
+      {
+        "from": "setup.sh",
+        "to": "setup.sh"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        }
+      ],
+      "darkModeSupport": true,
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist"
+    },
+    "dmg": {
+      "title": "Moonwalk",
+      "contents": [
+        {
+          "x": 130,
+          "y": 220
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    }
   }
 }

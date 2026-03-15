@@ -19,27 +19,8 @@ print = partial(print, flush=True)
 #  Tool Classification — drives verification strategy
 # ═══════════════════════════════════════════════════════════════
 
-_UI_MUTATING_TOOLS: frozenset[str] = frozenset({
-    # OS-level interaction
-    "click_ui", "type_in_field", "type_text", "press_key",
-    "run_shortcut", "click_element", "hover_element", "mouse_action",
-    # Browser ref-based interaction
-    "browser_click_ref", "browser_type_ref", "browser_select_ref",
-    "browser_click_match", "find_and_act",
-    # App lifecycle
-    "open_app", "open_url", "quit_app", "close_window",
-    # Google Workspace mutating actions
-    "gdocs_create", "gdocs_write", "gsheets_write", "gcal_create_event",
-})
-
-_READ_ONLY_TOOLS: frozenset[str] = frozenset({
-    "read_file", "list_directory", "get_web_information", "web_scrape",
-    "web_search", "browser_read_page", "browser_read_text",
-    "read_page_content", "extract_structured_data", "get_page_summary",
-    "browser_snapshot", "browser_find", "get_ui_tree", "read_screen",
-    "gdocs_read", "gsheets_read", "gdrive_search",
-    "gmail_read", "gcal_list_events", "gworkspace_analyze",
-})
+from agent.constants import UI_MUTATING_TOOLS as _UI_MUTATING_TOOLS
+from agent.constants import READ_ONLY_TOOLS as _READ_ONLY_TOOLS
 
 
 def _looks_like_ui_lookup_failure(text: str) -> bool:
@@ -88,21 +69,31 @@ class ToolVerifier:
     Uses tool-specific strategies for accurate verification.
     """
     
-    # Error patterns that indicate failure
+    # Error patterns that indicate failure.
+    # These are applied only to tool *error messages*, not to page content
+    # returned by read-only tools.  Patterns are anchored or scoped to
+    # reduce false positives from natural-language content.
     ERROR_PATTERNS = [
-        r"^error",
-        r"failed",
-        r"exception",
-        r"not found",
-        r"permission denied",
-        r"no such file",
-        r"command not found",
-        r"cannot",
-        r"couldn't",
-        r"unable to",
-        r"invalid",
-        r"timeout",
+        r"^error\b",           # starts with "error"
+        r"\bfailed to\b",     # "failed to …"
+        r"\bexception\b",
+        r"\bpermission denied\b",
+        r"\bno such file\b",
+        r"\bcommand not found\b",
+        r"\bunable to\b",
+        r"\btimeout\b",
     ]
+
+    # Tools whose results are user/page *content* — never run
+    # ERROR_PATTERNS against them because the words "error" or
+    # "invalid" may appear naturally in the text.
+    _CONTENT_TOOLS: frozenset[str] = frozenset({
+        "read_file", "browser_read_page", "browser_read_text",
+        "read_page_content", "get_page_summary", "web_scrape",
+        "get_web_information", "gdocs_read", "gsheets_read",
+        "gworkspace_analyze", "extract_structured_data",
+        "run_shell",
+    })
 
     def __init__(self):
         """Initialize with tool-specific verifiers."""
@@ -178,25 +169,7 @@ class ToolVerifier:
         # For content-returning tools, skip generic error check —
         # file contents and command output may naturally contain words like
         # "timeout", "error", "invalid" that are NOT actual failures.
-        content_tools = {
-            "read_file",
-            "run_shell",
-            "fetch_web_content",
-            "web_search",
-            "get_ui_tree",
-            "browser_snapshot",
-            "browser_find",
-            "browser_describe_ref",
-            "browser_refresh_refs",
-            "browser_wait_for",
-            "browser_assert",
-            "read_page_content",
-            "extract_structured_data",
-            "get_page_summary",
-            "web_scrape",
-            "get_web_information",
-        }
-        if tool_name not in content_tools:
+        if tool_name not in self._CONTENT_TOOLS:
             error_check = self._check_for_errors(tool_result)
             if error_check:
                 return error_check
@@ -238,7 +211,15 @@ class ToolVerifier:
         if tool_name == "gdocs_create" and string_result.success:
             return string_result
 
-        # Step 3: if UI-mutating tool, run visual verification
+        # Step 3: confidence-gate — skip expensive visual LLM call when
+        # string verification already has high confidence + clear success.
+        # This saves ~1.5-3.5 s per UI-mutating tool call.
+        if string_result.success and string_result.confidence >= 0.85:
+            print(f"[Verifier] ⚡ High-confidence skip for {tool_name} "
+                  f"(conf={string_result.confidence:.0%})")
+            return string_result
+
+        # Step 4: if UI-mutating tool, run visual verification
         if tool_name in _UI_MUTATING_TOOLS and get_visual_state is not None:
             try:
                 visual_summary = await get_visual_state()
@@ -303,7 +284,7 @@ class ToolVerifier:
         """Use visual evidence to override string-based verdict for UI tools."""
         try:
             from providers.router import ModelRouter
-            router = ModelRouter()
+            router = _get_shared_router()
 
             args_preview = str(tool_args)[:200]
             prompt = (
@@ -371,7 +352,7 @@ class ToolVerifier:
         """Ask Flash LLM if milestone is visually complete."""
         try:
             from providers.router import ModelRouter
-            router = ModelRouter()
+            router = _get_shared_router()
 
             prompt = (
                 f"Milestone goal: '{milestone_goal}'\n"
@@ -522,20 +503,29 @@ class ToolVerifier:
                 try:
                     state = await get_state()
                     current_app = state.get("active_app", "").lower()
-                    if target_app in current_app:
+                    if target_app in current_app or current_app in target_app:
                         return VerificationResult(
                             success=True,
                             confidence=0.95,
                             message=f"{target_app} is now the active app"
                         )
+                    else:
+                        # State check says a DIFFERENT app is active —
+                        # lower confidence so visual verification triggers.
+                        return VerificationResult(
+                            success=True,
+                            confidence=0.7,
+                            message=f"open_app reported success but active app is '{current_app}', not '{target_app}'",
+                            should_retry=True,
+                        )
                 except Exception:
                     pass
             
-            # Trust the result
+            # No state checker available — lower confidence to trigger visual verification
             return VerificationResult(
                 success=True,
-                confidence=0.85,
-                message=f"open_app reported success for {target_app}"
+                confidence=0.75,
+                message=f"open_app reported success for {target_app} (unverified)"
             )
         
         return VerificationResult(
@@ -1543,6 +1533,23 @@ class ToolVerifier:
             should_retry=True
         )
 
+    @staticmethod
+    def _is_search_engine_serp(url: str) -> bool:
+        """Return True if url is a search-engine results page (Google, Bing, etc.)."""
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(url or "").netloc.lower()
+            if host.startswith("www."):
+                host = host[4:]
+            _serp_hosts = {
+                "google.com", "bing.com",
+                "duckduckgo.com", "html.duckduckgo.com",
+                "yahoo.com", "search.yahoo.com", "baidu.com",
+            }
+            return host in _serp_hosts and ("/search" in (url or "") or "q=" in (url or ""))
+        except Exception:
+            return False
+
     async def _verify_get_web_information(
         self,
         args: Dict[str, Any],
@@ -1621,6 +1628,18 @@ class ToolVerifier:
             )
 
         if target_type == "page_summary":
+            result_url = str(data.get("url", "") or "").strip()
+            if self._is_search_engine_serp(result_url):
+                return VerificationResult(
+                    success=False,
+                    confidence=0.92,
+                    message=(
+                        f"get_web_information summarized a search-results page ({result_url[:80]}) "
+                        "instead of a content page — no real research data captured"
+                    ),
+                    should_retry=True,
+                    suggested_fix="Provide a direct URL from the search results (e.g. Wikipedia or IMDb) rather than summarizing the SERP.",
+                )
             summary_text = str(data.get("summary", "") or "").strip()
             headings = data.get("headings", [])
             page_type = str(data.get("page_type", "") or "").strip()
@@ -1741,6 +1760,21 @@ class ToolVerifier:
             message="gdocs_append result was unclear",
             should_retry=True,
         )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Shared Router for Visual Verification
+# ═══════════════════════════════════════════════════════════════
+
+_shared_router = None
+
+def _get_shared_router():
+    """Return a single ModelRouter instance shared across all visual verification calls."""
+    global _shared_router
+    if _shared_router is None:
+        from providers.router import ModelRouter
+        _shared_router = ModelRouter()
+    return _shared_router
 
 
 # ═══════════════════════════════════════════════════════════════

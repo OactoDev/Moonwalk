@@ -4,6 +4,7 @@ Moonwalk — Memory System
 Short-term: conversation turns (in-memory + persisted sessions)
 Working:    action log, entity ledger, session goal (current task context)
 Long-term:  user profile with auto-extracted facts
+Vault:      permanent cross-session storage (files, text, structured data)
 Background: recurring tasks (persisted JSON)
 """
 
@@ -11,20 +12,24 @@ import json
 import os
 import re
 import time
+import math
+import threading
 import uuid
-from collections import deque
+from collections import deque, Counter
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Any
 
 
 # ── Storage directory ──
 MOONWALK_DIR = os.path.expanduser("~/.moonwalk")
 SESSIONS_DIR = os.path.join(MOONWALK_DIR, "sessions")
+VAULT_DIR = os.path.join(MOONWALK_DIR, "vault")
 
 
 def _ensure_dir():
     os.makedirs(MOONWALK_DIR, exist_ok=True)
     os.makedirs(SESSIONS_DIR, exist_ok=True)
+    os.makedirs(VAULT_DIR, exist_ok=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -42,6 +47,9 @@ class ConversationMemory:
         self._persist = persist
         self._session_id: str = uuid.uuid4().hex[:12]
         self._session_summary: str = ""
+        self._io_lock = threading.Lock()  # guards disk read/write
+        self._save_timer: threading.Timer | None = None
+        self._save_dirty: bool = False
 
         # Try to resume a recent session
         if persist:
@@ -50,45 +58,62 @@ class ConversationMemory:
 
     def _try_resume_session(self, resume_window: float = 1800.0):
         """Load the most recent session if it's within the resume window."""
-        try:
-            sessions = []
-            for fname in os.listdir(SESSIONS_DIR):
-                if fname.endswith(".json"):
-                    fpath = os.path.join(SESSIONS_DIR, fname)
-                    mtime = os.path.getmtime(fpath)
-                    sessions.append((mtime, fpath, fname))
-            if not sessions:
-                return
-            sessions.sort(reverse=True)
-            most_recent_time, most_recent_path, fname = sessions[0]
+        with self._io_lock:
+            try:
+                sessions = []
+                for fname in os.listdir(SESSIONS_DIR):
+                    if fname.endswith(".json"):
+                        fpath = os.path.join(SESSIONS_DIR, fname)
+                        mtime = os.path.getmtime(fpath)
+                        sessions.append((mtime, fpath, fname))
+                if not sessions:
+                    return
+                sessions.sort(reverse=True)
+                most_recent_time, most_recent_path, fname = sessions[0]
 
-            if time.time() - most_recent_time <= resume_window:
-                with open(most_recent_path, "r") as f:
-                    data = json.load(f)
-                self._turns = data.get("turns", [])
-                self._session_id = data.get("session_id", fname.replace(".json", ""))
-                self._session_summary = data.get("summary", "")
-                self._last_activity = most_recent_time
-        except Exception:
-            pass  # Start fresh if anything fails
+                if time.time() - most_recent_time <= resume_window:
+                    with open(most_recent_path, "r") as f:
+                        data = json.load(f)
+                    self._turns = data.get("turns", [])
+                    self._session_id = data.get("session_id", fname.replace(".json", ""))
+                    self._session_summary = data.get("summary", "")
+                    self._last_activity = most_recent_time
+            except Exception:
+                pass  # Start fresh if anything fails
 
     def _save_session(self):
-        """Persist current session to disk."""
+        """Schedule a debounced persist — coalesces rapid successive writes."""
         if not self._persist or not self._turns:
             return
-        try:
-            _ensure_dir()
-            path = os.path.join(SESSIONS_DIR, f"{self._session_id}.json")
-            data = {
-                "session_id": self._session_id,
-                "turns": self._turns,
-                "summary": self._session_summary,
-                "updated_at": time.time(),
-            }
-            with open(path, "w") as f:
-                json.dump(data, f, indent=2)
-        except Exception:
-            pass
+        self._save_dirty = True
+        if self._save_timer is not None:
+            self._save_timer.cancel()
+        self._save_timer = threading.Timer(3.0, self._flush_save)
+        self._save_timer.daemon = True
+        self._save_timer.start()
+
+    def _flush_save(self):
+        """Actually write the session to disk (called by debounce timer or explicitly)."""
+        if not self._save_dirty:
+            return
+        self._save_dirty = False
+        with self._io_lock:
+            try:
+                _ensure_dir()
+                path = os.path.join(SESSIONS_DIR, f"{self._session_id}.json")
+                data = {
+                    "session_id": self._session_id,
+                    "turns": list(self._turns),
+                    "summary": self._session_summary,
+                    "updated_at": time.time(),
+                }
+                # Atomic write: write to temp file then rename
+                tmp_path = path + ".tmp"
+                with open(tmp_path, "w") as f:
+                    json.dump(data, f)
+                os.replace(tmp_path, path)
+            except Exception:
+                pass
 
     def add_user(self, text: str, context_summary: str = ""):
         """Add a user turn."""
@@ -142,28 +167,50 @@ class ConversationMemory:
 
     def clear(self):
         """Clear all conversation history."""
+        self._flush_save()  # persist any pending data before clearing
         self._turns.clear()
 
     def start_new_session(self):
         """Force start a new session (e.g., user explicitly says 'new conversation')."""
+        self._flush_save()  # persist the old session before starting fresh
         self._session_id = uuid.uuid4().hex[:12]
         self._turns.clear()
         self._session_summary = ""
         self._last_activity = time.time()
 
     def _trim(self):
-        """Keep only the last N turns, but add a compression summary if we drop turns."""
-        if len(self._turns) > self._max_turns:
-            dropped_count = len(self._turns) - self._max_turns
-            self._turns = self._turns[-self._max_turns:]
-            
-            # Inject a summary marker at the top to tell the model context was compressed
-            # Only do this if the first message isn't already a summary
-            if self._turns and self._turns[0].get("role") == "user":
-                first_text = self._turns[0].get("parts", [{}])[0].get("text", "")
-                if not first_text.startswith("[SYSTEM SUMMARY:"):
-                    compressed_msg = f"[SYSTEM SUMMARY: {dropped_count} older turns were removed from context to save memory. Rely on your long-term memory for older details.]\n\n{first_text}"
-                    self._turns[0]["parts"][0]["text"] = compressed_msg
+        """Keep only the last N turns.  When turns are dropped a
+        *separate* model summary turn is prepended so the original
+        first user message is never mutated."""
+        if len(self._turns) <= self._max_turns:
+            return
+        dropped_count = len(self._turns) - self._max_turns
+        self._turns = self._turns[-self._max_turns:]
+
+        # If the first surviving turn is already our synthetic summary,
+        # update it in-place rather than stacking summaries.
+        if (
+            self._turns
+            and self._turns[0].get("role") == "model"
+            and self._turns[0].get("parts", [{}])[0].get("text", "").startswith("[CONTEXT SUMMARY")
+        ):
+            self._turns[0]["parts"][0]["text"] = (
+                f"[CONTEXT SUMMARY: {dropped_count} older turns were removed "
+                f"from context to save memory.  Rely on long-term memory for older details.]"
+            )
+            return
+
+        # Otherwise prepend a new model turn (keeps user messages pristine).
+        summary_turn = {
+            "role": "model",
+            "parts": [{
+                "text": (
+                    f"[CONTEXT SUMMARY: {dropped_count} older turns were removed "
+                    f"from context to save memory.  Rely on long-term memory for older details.]"
+                )
+            }],
+        }
+        self._turns.insert(0, summary_turn)
 
     def _check_timeout(self):
         """Auto-clear if idle for too long."""
@@ -384,10 +431,14 @@ class WorkingMemory:
 
     # ── Research snippet tracking ──
 
-    def log_research_snippet(self, source: str, title: str, content: str, tool: str = ""):
-        """Store a research snippet extracted during browsing/reading."""
+    def log_research_snippet(self, source: str, title: str, content: str, tool: str = "") -> bool:
+        """Store a research snippet extracted during browsing/reading.
+
+        Returns True if the snippet was newly stored or an existing one was upgraded,
+        False if the content was rejected (junk, duplicate, or not richer).
+        """
         if not content or len(content.strip()) < 40:
-            return  # Too short to be useful research
+            return False  # Too short to be useful research
 
         # Skip search engine pages and homepages — not real research
         _src = (source or "").lower()
@@ -400,16 +451,23 @@ class WorkingMemory:
             "https://google.com", "https://www.bing.com",
         )
         if any(p in _src for p in _junk_patterns) or _src.rstrip("/") in _junk_exact:
-            return  # Skip search engine pages
+            return False  # Skip search engine pages
 
         # Skip content that's mostly browser element references (not readable text)
         if content.count("[mw_") > 3:
-            return  # Browser chrome, not research content
+            return False  # Browser chrome, not research content
 
         normalized_source = (source or "").strip().rstrip("/")
         normalized_title = (title or "").strip().lower()
         normalized_content = " ".join(content.split()).strip().lower()
         content_key = normalized_content[:600]
+
+        # Count how many snippets already exist from this URL so we can allow up to
+        # 3 different-target_type views of the same page (summary, structured, content).
+        url_snippet_count = sum(
+            1 for e in self._research_snippets
+            if str(e.get("source", "")).strip().rstrip("/") == normalized_source
+        )
 
         for existing in self._research_snippets:
             existing_source = str(existing.get("source", "")).strip().rstrip("/")
@@ -419,14 +477,55 @@ class WorkingMemory:
             same_source = bool(normalized_source and existing_source and existing_source == normalized_source)
             same_title = bool(normalized_title and existing_title and existing_title == normalized_title)
             same_content = bool(content_key and existing_content and existing_content == content_key)
-            if same_content or (same_source and (same_title or content_key == existing_content)):
-                # Prefer the richer version of the same source/snippet.
+
+            # Hard-dedup: identical content body → update in-place only if richer, then stop.
+            if same_content:
                 if len(content) > len(str(existing.get("content", ""))):
                     existing["content"] = content.strip()[:2000]
                     existing["title"] = title or existing.get("title", "")
                     existing["tool"] = tool or existing.get("tool", "")
                     existing["ts"] = time.time()
-                return
+                return False  # Exact duplicate — not a new addition
+
+            # Same source + same title (same page): always take the longer version so
+            # a richer target_type (page_summary vs nav-link structured_data) wins.
+            if same_source and same_title:
+                existing_len = len(str(existing.get("content", "")))
+                if len(content) > existing_len:
+                    existing["content"] = content.strip()[:2000]
+                    existing["tool"] = tool or existing.get("tool", "")
+                    existing["ts"] = time.time()
+                    print(
+                        f"[WorkingMemory] 📚 Upgraded snippet from '{source}' "
+                        f"({existing_len} → {len(content)} chars)"
+                    )
+                    return True  # Upgraded in-place
+                return False  # Not richer — keep existing
+
+        # Allow up to 3 snippets per URL — different target_types (page_content,
+        # structured_data, page_summary) each capture complementary information.
+        if url_snippet_count >= 3:
+            # Replace the shortest existing snippet from this URL if the new one is richer.
+            candidates = [
+                (i, e) for i, e in enumerate(self._research_snippets)
+                if str(e.get("source", "")).strip().rstrip("/") == normalized_source
+            ]
+            if candidates:
+                worst_i, worst = min(candidates, key=lambda x: len(str(x[1].get("content", ""))))
+                if len(content) > len(str(worst.get("content", ""))):
+                    self._research_snippets[worst_i] = {
+                        "source": source or "unknown",
+                        "title": title or "",
+                        "content": content.strip()[:2000],
+                        "tool": tool,
+                        "ts": time.time(),
+                    }
+                    print(
+                        f"[WorkingMemory] 📚 Replaced weaker snippet from '{source}' "
+                        f"with richer content ({len(content)} chars)"
+                    )
+                    return True
+            return False  # At limit and no improvement
 
         snippet = {
             "source": source or "unknown",
@@ -440,6 +539,7 @@ class WorkingMemory:
         while len(self._research_snippets) > self._max_research_snippets:
             self._research_snippets.pop(0)
         print(f"[WorkingMemory] 📚 Stored research snippet from '{source}' ({len(content)} chars)")
+        return True
 
     def get_research_snippets(self) -> list[dict]:
         """Return all stored research snippets."""
@@ -580,6 +680,16 @@ class WorkingMemory:
         self._last_typed_text = ""
         self._opened_urls.clear()
         self._research_snippets.clear()
+        self._search_leads.clear()
+
+    def reset_for_new_session(self):
+        """Explicit session-boundary reset — clears all transient state.
+
+        Should be called whenever ConversationMemory.start_new_session()
+        is invoked so that stale actions/entities from a previous task
+        don't bleed into the next one.
+        """
+        self.clear()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -819,3 +929,375 @@ class TaskStore:
 
     def list_active(self) -> list[BackgroundTask]:
         return [t for t in self._tasks.values() if t.active]
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Vault Memory (permanent cross-session storage)
+# ═══════════════════════════════════════════════════════════════
+
+# Valid vault categories — each maps to a subfolder under ~/.moonwalk/vault/
+VAULT_CATEGORIES = frozenset({
+    "notes",           # Free-form text notes, reminders, instructions
+    "contacts",        # People: names, phone numbers, emails, relationships
+    "documents",       # Stored documents (CV, cover letters, lists)
+    "preferences",     # Deeper preferences beyond UserProfile (budgets, styles)
+    "research",        # Persisted research findings worth keeping long-term
+    "shopping",        # Shopping lists, wishlists, product comparisons
+    "conversations",   # Key conversation takeaways worth remembering
+    "files",           # File references and metadata
+})
+
+_VAULT_MAX_ENTRIES = 500       # hard cap across all categories
+_VAULT_MAX_ENTRY_BYTES = 50000  # 50 KB per entry
+
+
+class VaultMemory:
+    """Permanent cross-session memory vault.
+
+    Stores typed entries (text, structured data, file references) as individual
+    JSON files under ``~/.moonwalk/vault/<category>/``.  Supports TF-IDF search
+    across all entries for recall.
+    """
+
+    def __init__(self) -> None:
+        _ensure_dir()
+        self._index_path = os.path.join(VAULT_DIR, "_index.json")
+        self._index: list[dict] = self._load_index()
+        self._lock = threading.Lock()
+
+    # ── Persistence ──
+
+    def _load_index(self) -> list[dict]:
+        if os.path.exists(self._index_path):
+            try:
+                with open(self._index_path, "r") as f:
+                    data = json.load(f)
+                return data if isinstance(data, list) else []
+            except Exception:
+                return []
+        return []
+
+    def _save_index(self) -> None:
+        try:
+            tmp = self._index_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self._index, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, self._index_path)
+        except Exception as e:
+            print(f"[VaultMemory] ⚠ Failed to save index: {e}")
+
+    def _entry_path(self, entry_id: str, category: str) -> str:
+        cat_dir = os.path.join(VAULT_DIR, category)
+        os.makedirs(cat_dir, exist_ok=True)
+        return os.path.join(cat_dir, f"{entry_id}.json")
+
+    # ── Store ──
+
+    def store(
+        self,
+        category: str,
+        title: str,
+        content: str,
+        *,
+        tags: Optional[List[str]] = None,
+        source: str = "",
+        structured_data: Optional[dict] = None,
+    ) -> dict:
+        """Store a new entry in the vault.
+
+        Returns the stored entry metadata dict (including its ``id``).
+        """
+        category = (category or "notes").strip().lower()
+        if category not in VAULT_CATEGORIES:
+            category = "notes"
+        title = (title or "").strip()[:200]
+        content = (content or "").strip()
+        if not content and not structured_data:
+            return {"ok": False, "error": "Nothing to store — content is empty."}
+
+        # Enforce size limit
+        content_bytes = len(content.encode("utf-8", errors="replace"))
+        if content_bytes > _VAULT_MAX_ENTRY_BYTES:
+            content = content[: _VAULT_MAX_ENTRY_BYTES // 2]  # truncate
+
+        entry_id = f"v_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        entry = {
+            "id": entry_id,
+            "category": category,
+            "title": title,
+            "content": content,
+            "tags": [t.strip().lower() for t in (tags or []) if t.strip()],
+            "source": (source or "").strip()[:300],
+            "structured_data": structured_data,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+
+        with self._lock:
+            # Check for near-duplicate: same category + very similar title
+            for existing in self._index:
+                if (
+                    existing.get("category") == category
+                    and self._titles_match(existing.get("title", ""), title)
+                ):
+                    # Update in-place
+                    old_id = existing["id"]
+                    existing.update({
+                        "title": title or existing["title"],
+                        "content_preview": content[:200],
+                        "tags": entry["tags"] or existing.get("tags", []),
+                        "source": source or existing.get("source", ""),
+                        "updated_at": time.time(),
+                    })
+                    # Overwrite the file
+                    entry["id"] = old_id
+                    try:
+                        path = self._entry_path(old_id, category)
+                        with open(path, "w") as f:
+                            json.dump(entry, f, indent=2, ensure_ascii=False)
+                    except Exception as e:
+                        print(f"[VaultMemory] ⚠ Failed to update entry: {e}")
+                    self._save_index()
+                    print(f"[VaultMemory] 📝 Updated vault entry: [{category}] {title[:60]}")
+                    return {"ok": True, "id": old_id, "action": "updated"}
+
+            # Enforce global cap
+            if len(self._index) >= _VAULT_MAX_ENTRIES:
+                self._evict_oldest()
+
+            # Write entry file
+            try:
+                path = self._entry_path(entry_id, category)
+                with open(path, "w") as f:
+                    json.dump(entry, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                print(f"[VaultMemory] ⚠ Failed to write entry: {e}")
+                return {"ok": False, "error": str(e)}
+
+            # Add to index
+            self._index.append({
+                "id": entry_id,
+                "category": category,
+                "title": title,
+                "content_preview": content[:200],
+                "tags": entry["tags"],
+                "source": entry["source"],
+                "created_at": entry["created_at"],
+                "updated_at": entry["updated_at"],
+            })
+            self._save_index()
+
+        print(f"[VaultMemory] 💾 Stored vault entry: [{category}] {title[:60]} ({len(content)} chars)")
+        return {"ok": True, "id": entry_id, "action": "created"}
+
+    # ── Recall ──
+
+    def recall(
+        self,
+        query: str = "",
+        category: str = "",
+        tags: Optional[List[str]] = None,
+        max_results: int = 10,
+    ) -> list[dict]:
+        """Search the vault by query (TF-IDF), category, and/or tags.
+
+        Returns a list of entry dicts sorted by relevance, each with full content.
+        """
+        with self._lock:
+            candidates = list(self._index)
+
+        # Filter by category
+        if category:
+            cat = category.strip().lower()
+            candidates = [e for e in candidates if e.get("category") == cat]
+
+        # Filter by tags
+        if tags:
+            tag_set = {t.strip().lower() for t in tags if t.strip()}
+            candidates = [
+                e for e in candidates
+                if tag_set.intersection(set(e.get("tags", [])))
+            ]
+
+        if not candidates:
+            return []
+
+        # If query given, score by TF-IDF cosine similarity
+        if query and query.strip():
+            scored = self._tfidf_rank(query.strip(), candidates)
+            candidates = [e for e, _ in scored[:max_results]]
+        else:
+            # No query — return most recent
+            candidates.sort(key=lambda e: e.get("updated_at", 0), reverse=True)
+            candidates = candidates[:max_results]
+
+        # Load full content for each result
+        results = []
+        for entry_meta in candidates:
+            full = self._load_entry(entry_meta["id"], entry_meta["category"])
+            if full:
+                results.append(full)
+            else:
+                results.append(entry_meta)  # index-only fallback
+        return results
+
+    def delete(self, entry_id: str) -> bool:
+        """Remove an entry from the vault by ID."""
+        with self._lock:
+            target = None
+            for i, e in enumerate(self._index):
+                if e.get("id") == entry_id:
+                    target = i
+                    break
+            if target is None:
+                return False
+            removed = self._index.pop(target)
+            # Delete file
+            try:
+                path = self._entry_path(entry_id, removed.get("category", "notes"))
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+            self._save_index()
+        print(f"[VaultMemory] 🗑 Deleted vault entry: {entry_id}")
+        return True
+
+    def list_entries(self, category: str = "", limit: int = 50) -> list[dict]:
+        """List vault entries (index metadata only — no full content)."""
+        with self._lock:
+            entries = list(self._index)
+        if category:
+            cat = category.strip().lower()
+            entries = [e for e in entries if e.get("category") == cat]
+        entries.sort(key=lambda e: e.get("updated_at", 0), reverse=True)
+        return entries[:limit]
+
+    def get_stats(self) -> dict:
+        """Return vault statistics for prompt injection."""
+        with self._lock:
+            total = len(self._index)
+        by_cat: dict[str, int] = {}
+        for e in self._index:
+            cat = e.get("category", "notes")
+            by_cat[cat] = by_cat.get(cat, 0) + 1
+        return {"total_entries": total, "by_category": by_cat}
+
+    # ── Prompt injection ──
+
+    def to_prompt_string(self) -> str:
+        """Format a compact vault summary for the LLM system prompt."""
+        stats = self.get_stats()
+        if stats["total_entries"] == 0:
+            return ""
+
+        lines = [
+            f"[Vault Memory — {stats['total_entries']} permanent entries across sessions]",
+            "  Categories: " + ", ".join(
+                f"{cat} ({count})" for cat, count in sorted(stats["by_category"].items())
+            ),
+        ]
+
+        # Include the 5 most recent entry titles as hints
+        recent = self.list_entries(limit=5)
+        if recent:
+            lines.append("  Recent entries:")
+            for entry in recent:
+                cat = entry.get("category", "")
+                title = entry.get("title", "(untitled)")[:80]
+                lines.append(f"    • [{cat}] {title}")
+            lines.append(
+                "  Use recall_memory to search or retrieve any stored entry."
+            )
+
+        return "\n".join(lines)
+
+    # ── Internal helpers ──
+
+    def _load_entry(self, entry_id: str, category: str) -> Optional[dict]:
+        path = self._entry_path(entry_id, category)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _evict_oldest(self) -> None:
+        """Remove the oldest entry to make room."""
+        if not self._index:
+            return
+        oldest = min(self._index, key=lambda e: e.get("created_at", 0))
+        idx = self._index.index(oldest)
+        removed = self._index.pop(idx)
+        try:
+            path = self._entry_path(removed["id"], removed.get("category", "notes"))
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _titles_match(a: str, b: str) -> bool:
+        """Check if two titles are effectively the same."""
+        na = " ".join(a.lower().split())
+        nb = " ".join(b.lower().split())
+        if not na or not nb:
+            return False
+        return na == nb or (len(na) > 10 and na in nb) or (len(nb) > 10 and nb in na)
+
+    def _tfidf_rank(
+        self, query: str, entries: list[dict]
+    ) -> list[tuple[dict, float]]:
+        """Rank entries by TF-IDF cosine similarity to the query."""
+        def tokenize(text: str) -> list[str]:
+            return re.findall(r"[a-z0-9]+", text.lower())
+
+        query_tokens = tokenize(query)
+        if not query_tokens:
+            return [(e, 0.0) for e in entries]
+
+        # Build per-entry token lists from title + preview + tags
+        entry_token_lists = []
+        for e in entries:
+            parts = [
+                e.get("title", ""),
+                e.get("content_preview", ""),
+                " ".join(e.get("tags", [])),
+            ]
+            entry_token_lists.append(tokenize(" ".join(parts)))
+
+        # Document frequency
+        n_docs = len(entries) + 1
+        df: Counter = Counter()
+        all_tokens = set(query_tokens)
+        for tl in entry_token_lists:
+            all_tokens.update(tl)
+        for token in all_tokens:
+            for tl in entry_token_lists:
+                if token in tl:
+                    df[token] += 1
+
+        def tfidf_vec(tokens: list[str]) -> dict[str, float]:
+            tf: Counter = Counter(tokens)
+            vec: dict[str, float] = {}
+            for t, count in tf.items():
+                idf = math.log((n_docs + 1) / (df.get(t, 0) + 1)) + 1
+                vec[t] = count * idf
+            return vec
+
+        q_vec = tfidf_vec(query_tokens)
+
+        scored: list[tuple[dict, float]] = []
+        for entry, tokens in zip(entries, entry_token_lists):
+            e_vec = tfidf_vec(tokens)
+            # Cosine similarity
+            dot = sum(q_vec.get(t, 0) * e_vec.get(t, 0) for t in q_vec)
+            mag_q = math.sqrt(sum(v * v for v in q_vec.values())) or 1.0
+            mag_e = math.sqrt(sum(v * v for v in e_vec.values())) or 1.0
+            sim = dot / (mag_q * mag_e)
+            scored.append((entry, sim))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored

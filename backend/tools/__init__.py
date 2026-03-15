@@ -16,6 +16,8 @@ import tools.cloud_tools        # noqa: F401  — Cloud-safe tools
 import tools.browser_tools      # noqa: F401  — Browser ref tools
 import tools.browser_aci        # noqa: F401  — ACI compound browser tools
 import tools.gworkspace_tools   # noqa: F401  — Google Workspace tools
+import tools.vault_tools        # noqa: F401  — Vault memory tools
+import tools.form_tools         # noqa: F401  — Form fill tools
 
 __all__ = [
     "registry",

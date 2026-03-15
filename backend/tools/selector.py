@@ -61,6 +61,31 @@ _TOOL_GATEWAY_CONTEXT: contextvars.ContextVar[dict] = contextvars.ContextVar(
     default={},
 )
 
+_WEB_PROGRESS_CALLBACK: contextvars.ContextVar = contextvars.ContextVar(
+    "moonwalk_web_progress_callback",
+    default=None,
+)
+
+
+def set_web_progress_callback(cb) -> None:
+    """Set the async callback for web gateway progress updates."""
+    _WEB_PROGRESS_CALLBACK.set(cb)
+
+
+async def _emit_web_progress(text: str, variant: str = "browsing") -> None:
+    """Emit a doing-state progress update to the Electron overlay."""
+    cb = _WEB_PROGRESS_CALLBACK.get(None)
+    if cb:
+        try:
+            await cb({
+                "type": "doing",
+                "text": text,
+                "tool": "get_web_information",
+                "variant": variant,
+            })
+        except Exception:
+            pass
+
 _ABSTRACT_WEB_INFO_TOOLS: frozenset[str] = frozenset({
     "web_search",
     "fetch_web_content",
@@ -98,8 +123,8 @@ _MILESTONE_HINT_EQUIVALENTS: dict[str, set[str]] = {
     "write_file": {"write_file", "read_file", "replace_in_file", "list_directory", "run_shell"},
     "replace_in_file": {"replace_in_file", "read_file", "list_directory", "run_shell"},
     "run_shell": {"run_shell", "read_file", "list_directory", "write_file"},
-    # App control
-    "open_app": {"open_app", "get_ui_tree"},
+    # App control (expanded: messaging tasks need UI tools after opening the app)
+    "open_app": {"open_app", "get_ui_tree", "click_ui", "type_in_field", "type_text", "press_key", "read_screen"},
     # UI interaction (with cross-perception)
     "click_ui": {"click_ui", "type_in_field", "type_text", "press_key", "run_shortcut", "get_ui_tree", "open_app", "read_screen"},
     "type_in_field": {"type_in_field", "click_ui", "type_text", "press_key", "run_shortcut", "get_ui_tree", "open_app", "read_screen"},
@@ -152,6 +177,7 @@ _DIRECT_MESSAGE_TOOLS = (
     "press_key",
     "run_shortcut",
     "get_ui_tree",
+    "send_imessage",
 )
 
 _STICKY_ROUTE_TTL_S = 300.0
@@ -320,6 +346,39 @@ def _is_search_results_url(url: str) -> bool:
     return "/search" in lowered or "q=" in lowered
 
 
+# Known source-name → domain hints used to detect when a query explicitly asks
+# for a different source than the cached selected_source_url.
+_EXPLICIT_SOURCE_HINTS: dict[str, str] = {
+    "wikipedia": "wikipedia.org",
+    "wiki": "wikipedia.org",
+    "imdb": "imdb.com",
+    "reddit": "reddit.com",
+    "youtube": "youtube.com",
+    "twitter": "twitter.com",
+    "github": "github.com",
+    "stackoverflow": "stackoverflow.com",
+    "metacritic": "metacritic.com",
+    "rotten tomatoes": "rottentomatoes.com",
+    "rottentomatoes": "rottentomatoes.com",
+    "amazon": "amazon.com",
+}
+
+
+def _query_names_different_source(query: str, cached_url: str) -> bool:
+    """Return True when the query explicitly names a source that doesn't match the cached URL.
+
+    Used to bypass the request-state selected_source_url cache when the LLM is
+    clearly asking for a different source (e.g. query contains 'Wikipedia' but
+    the cache holds an IMDb URL).
+    """
+    q = (query or "").lower()
+    cu = (cached_url or "").lower()
+    for hint, domain in _EXPLICIT_SOURCE_HINTS.items():
+        if hint in q and domain not in cu:
+            return True
+    return False
+
+
 def _normalize_web_target_type(target_type: str) -> str:
     norm = _norm_text(target_type)
     alias_map = {
@@ -349,21 +408,15 @@ def _prefer_browser_route(target_type: str, explicit_url: str, context: dict) ->
     live_context = _sync_live_browser_context(context)
     if live_context.get("background_mode"):
         return False
-    browser_url = str(live_context.get("browser_url", "") or "").strip()
-    if explicit_url and browser_url and explicit_url.rstrip("/") == browser_url.rstrip("/"):
-        return True
-    if target_type == "search_results":
-        return False
-    return bool(browser_url and _has_live_browser_bridge(live_context))
+    # When browser bridge is connected, always prefer browser
+    return bool(_has_live_browser_bridge(live_context))
 
 
 def _fallback_route_after_planner_error(target_type: str, explicit_url: str, context: dict) -> str:
-    # Degraded direct URL reads should default to background fetch unless the
-    # explicit URL is itself a live search-results page.
-    if explicit_url and target_type in {"page_content", "page_summary", "structured_data"}:
-        if not _is_search_results_url(explicit_url):
-            return "background_fetch"
-    return "browser_aci" if _prefer_browser_route(target_type, explicit_url, context) else "background_fetch"
+    # When browser is connected, stay on browser_aci even in degraded mode
+    if _prefer_browser_route(target_type, explicit_url, context):
+        return "browser_aci"
+    return "background_fetch"
 
 
 def _urls_match_loose(left: str, right: str) -> bool:
@@ -934,6 +987,9 @@ async def get_web_information(
         if current_url.rstrip("/") == target_url.rstrip("/"):
             return str(context.get("browser_session_id", ""))
 
+        domain_label = _domain(target_url) or target_url[:40]
+        await _emit_web_progress(f"Opening {domain_label}…", "browsing")
+
         if _is_search_results_url(current_url):
             try:
                 raw = await tool_registry.execute(
@@ -972,8 +1028,12 @@ async def get_web_information(
 
         await tool_registry.execute("open_url", {"url": target_url})
         
-        # Wait up to 5 seconds for a snapshot matching the target domain
+        # Wait up to 5 seconds for a snapshot whose URL actually matches the
+        # TARGET path — not just the domain.  The old domain-only check would
+        # match a pre-existing tab on the same domain (e.g. /details/dates
+        # when we wanted /rules) and return immediately, skipping the wait.
         target_domain = _domain(target_url)
+        target_path = urlparse(target_url).path.rstrip("/") or ""
         started = time.time()
         target_session_id = ""
         while time.time() - started < 5.0:
@@ -981,7 +1041,17 @@ async def get_web_information(
             # Check for a match in ANY known session snapshot
             match_sid = ""
             for sid, snap in getattr(browser_store, "_snapshots", {}).items():
-                if target_domain in str(getattr(snap, "url", "") or ""):
+                snap_url = str(getattr(snap, "url", "") or "")
+                if not snap_url:
+                    continue
+                snap_domain = _domain(snap_url)
+                snap_path = urlparse(snap_url).path.rstrip("/") or ""
+                # Require both domain AND path to match the target
+                if snap_domain == target_domain and (
+                    snap_path == target_path
+                    or target_path.startswith(snap_path)
+                    or snap_path.startswith(target_path)
+                ):
                     match_sid = sid
                     break
             if match_sid:
@@ -989,10 +1059,53 @@ async def get_web_information(
                 break
             
             s_cand = _lookup_snapshot("")
-            if s_cand and target_domain in str(s_cand.url or ""):
-                target_session_id = str(s_cand.session_id)
-                break
+            if s_cand:
+                cand_url = str(s_cand.url or "")
+                cand_domain = _domain(cand_url)
+                cand_path = urlparse(cand_url).path.rstrip("/") or ""
+                if cand_domain == target_domain and (
+                    cand_path == target_path
+                    or target_path.startswith(cand_path)
+                    or cand_path.startswith(target_path)
+                ):
+                    target_session_id = str(s_cand.session_id)
+                    break
                 
+        # Issue 4: JS-SPA navigation fallback — if we're on the right domain but
+        # the target path is still not matched (e.g. devpost /rules rendered via a
+        # JS tab-swap without a URL change), try clicking a nav element whose text
+        # matches the last path segment (e.g. "rules", "prizes", "judges").
+        if not target_session_id:
+            s_cand = _lookup_snapshot("")
+            if s_cand:
+                cand_url = str(getattr(s_cand, "url", "") or "")
+                if _domain(cand_url) == target_domain and target_path:
+                    path_seg = target_path.split("/")[-1].strip().lower()
+                    if path_seg:
+                        try:
+                            await tool_registry.execute(
+                                "browser_click_match", {"query": path_seg}
+                            )
+                            await asyncio.sleep(1.5)
+                            # Re-check snapshots after click
+                            for sid, snap in getattr(browser_store, "_snapshots", {}).items():
+                                snap_url2 = str(getattr(snap, "url", "") or "")
+                                if snap_url2 and _domain(snap_url2) == target_domain and (
+                                    target_path in urlparse(snap_url2).path
+                                    or path_seg in snap_url2.lower()
+                                ):
+                                    target_session_id = sid
+                                    break
+                            if not target_session_id:
+                                s2 = _lookup_snapshot("")
+                                if s2 and (
+                                    target_path in str(s2.url or "")
+                                    or path_seg in str(s2.url or "").lower()
+                                ):
+                                    target_session_id = str(s2.session_id)
+                        except Exception:
+                            pass
+
         try:
             await tool_registry.execute("browser_refresh_refs", {"session_id": target_session_id})
         except Exception:
@@ -1003,6 +1116,7 @@ async def get_web_information(
         context.update(_sync_live_browser_context(context))
         target_session_id = ""
         if query:
+            await _emit_web_progress(f"Searching: {query[:40]}…", "searching")
             await tool_registry.execute("web_search", {"query": query})
             
             # Wait up to 5 seconds for a search results snapshot
@@ -1077,8 +1191,6 @@ async def get_web_information(
 
         context.update(_sync_live_browser_context(context))
         error_code = str(last_error.get("error_code", "")).strip() or "browser_search_no_results"
-        if _is_browser_search_infra_error(error_code) and not _prefer_browser_route(target_type, url, context):
-            return await _background_search_payload(resolved_route="background_fetch_fallback")
 
         return _gateway_error(
             last_error.get("message", "Live browser search could not extract visible results."),
@@ -1096,6 +1208,15 @@ async def get_web_information(
         request_state = runtime_state_store.snapshot().request_state
         cached_source_url = str(getattr(request_state, "selected_source_url", "") or "").strip()
         cached_source_label = str(getattr(request_state, "selected_source_label", "") or "").strip()
+        # Bypass cache when the query explicitly requests a different source domain
+        # (e.g. query says 'wikipedia' but cache holds imdb.com) to avoid stalls.
+        if cached_source_url and _query_names_different_source(query, cached_source_url):
+            print(
+                f"[WebGateway] cache bypass — query names a different source than "
+                f"'{cached_source_url}'; doing fresh search"
+            )
+            cached_source_url = ""
+            cached_source_label = ""
         if cached_source_url:
             follow_meta = {
                 "selected_source_url": cached_source_url,
@@ -1181,7 +1302,10 @@ async def get_web_information(
         if resolved_route == "browser_aci":
             await _browser_open_if_needed(chosen_url)
 
+            chosen_domain = _domain(chosen_url) or chosen_label[:30] or "page"
+
             if target_type == "page_summary":
+                await _emit_web_progress(f"Analyzing {chosen_domain}…", "browsing")
                 raw = await tool_registry.execute("get_page_summary", {})
                 data = _safe_json(raw)
                 if data.get("ok") is False:
@@ -1206,6 +1330,7 @@ async def get_web_information(
                 )
 
             if target_type == "structured_data":
+                await _emit_web_progress(f"Extracting data from {chosen_domain}…", "browsing")
                 raw = await tool_registry.execute(
                     "extract_structured_data",
                     {"item_type": item_hint, "query": query, "max_items": max_items},
@@ -1240,6 +1365,7 @@ async def get_web_information(
                     **follow_meta,
                 )
 
+            await _emit_web_progress(f"Reading {chosen_domain}…", "browsing")
             raw = await tool_registry.execute(
                 "read_page_content",
                 {"max_chars": max_chars, "scroll_pages": 2},
@@ -1283,7 +1409,10 @@ async def get_web_information(
         if url:
             target_session_id = await _browser_open_if_needed(url)
 
+        page_label = _domain(url or str(context.get("browser_url", "")) or "") or "page"
+
         if target_type == "page_summary":
+            await _emit_web_progress(f"Analyzing {page_label}…", "browsing")
             raw = await tool_registry.execute("get_page_summary", {"session_id": target_session_id})
             data = _safe_json(raw)
             if data.get("ok") is False:
@@ -1300,14 +1429,13 @@ async def get_web_information(
             return _gateway_error("No page summary available", target_type=target_type, route=route)
 
         if target_type == "structured_data":
+            await _emit_web_progress(f"Extracting data from {page_label}…", "browsing")
             raw = await tool_registry.execute(
                 "extract_structured_data",
                 {"item_type": item_hint, "query": query, "max_items": max_items, "session_id": target_session_id},
             )
             data = _safe_json(raw)
             if data.get("ok") is False:
-                if url:
-                    return await _background_page_payload(target_url=url, resolved_route="background_fetch_fallback")
                 return _gateway_error(
                     data.get("message", "structured extraction failed"),
                     target_type=target_type,
@@ -1325,19 +1453,15 @@ async def get_web_information(
                         data["content_length"] = len(preview)
                 _clear_sticky_route(sticky_key)
                 return _gateway_success(data, resolved_route=route)
-            if url:
-                _record_sticky_route(sticky_key, "background_fetch", "Browser structured extraction failed for explicit URL.")
-                return await _background_page_payload(target_url=url, resolved_route="background_fetch_fallback")
             return _gateway_error("No structured data extracted", target_type=target_type, route=route, item_hint=item_hint)
 
+        await _emit_web_progress(f"Reading {page_label}…", "browsing")
         raw = await tool_registry.execute(
             "read_page_content",
             {"max_chars": max_chars, "scroll_pages": 2, "session_id": target_session_id},
         )
         data = _safe_json(raw)
         if data.get("ok") is False:
-            if url:
-                return await _background_page_payload(target_url=url, resolved_route="background_fetch_fallback")
             return _gateway_error(
                 data.get("message", "page read failed"),
                 target_type="page_content",
@@ -1349,10 +1473,6 @@ async def get_web_information(
             data["ok"] = True
             _clear_sticky_route(sticky_key)
             return _gateway_success(data, resolved_route=route)
-
-        if url:
-            _record_sticky_route(sticky_key, "background_fetch", "Browser page read returned no readable content for explicit URL.")
-            return await _background_page_payload(target_url=url, resolved_route="background_fetch_fallback")
 
         fallback = await tool_registry.execute("browser_read_page", {"query": query, "refresh": True, "session_id": target_session_id})
         fb = _safe_json(fallback)
@@ -1453,10 +1573,20 @@ class ToolCategories:
         "browser_click_ref", "browser_type_ref", "browser_select_ref",
         "browser_list_tabs", "browser_switch_tab", "browser_refresh_refs",
         "gworkspace_analyze", "gdocs_create", "gdocs_append", "write_file", "read_file",
+        "remember_this", "recall_memory",
     }
+
+    # Vault memory — permanent cross-session storage
+    VAULT = {"remember_this", "recall_memory", "forget_this"}
+
+    # Messaging — visual message sending
+    MESSAGING = {"send_imessage"}
+
+    # Form filling — vault-powered form automation
+    FORM = {"fill_form"}
     
     # All tools combined
-    ALL = CORE | PERCEPTION | SMART_INTERACTION | BROWSER_DOM | BROWSER_LEGACY | APP_CONTROL | UI_AUTOMATION | MEDIA | FILE_SYSTEM | WINDOW | CLIPBOARD | IMAGE | GOOGLE_WORKSPACE | GATEWAY | RESEARCH
+    ALL = CORE | PERCEPTION | SMART_INTERACTION | BROWSER_DOM | BROWSER_LEGACY | APP_CONTROL | UI_AUTOMATION | MEDIA | FILE_SYSTEM | WINDOW | CLIPBOARD | IMAGE | GOOGLE_WORKSPACE | GATEWAY | RESEARCH | VAULT | MESSAGING | FORM
 
 
 CORE_PRIORITY = ["send_response", "await_reply"]

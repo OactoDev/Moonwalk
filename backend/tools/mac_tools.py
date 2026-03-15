@@ -212,13 +212,16 @@ async def open_app(app_name: str) -> str:
         stderr_text = stderr.decode("utf-8", "ignore").strip()
         return f"Couldn't find '{app_name}' as an installed app{': ' + stderr_text if stderr_text else ''}"
 
-    # Verify it actually came to foreground
-    await asyncio.sleep(1.0)
-    active = await _osascript(
-        'tell application "System Events" to get name of first process whose frontmost is true'
-    )
-    if active and launch_name.lower() in active.lower():
-        return f"Opened {launch_name} — it's now in the foreground."
+    # Verify it actually came to foreground — poll every 100ms, max 1.0s
+    _deadline = asyncio.get_event_loop().time() + 1.0
+    active = ""
+    while asyncio.get_event_loop().time() < _deadline:
+        await asyncio.sleep(0.1)
+        active = await _osascript(
+            'tell application "System Events" to get name of first process whose frontmost is true'
+        )
+        if active and launch_name.lower() in active.lower():
+            return f"Opened {launch_name} — it's now in the foreground."
     # App launched but might not be frontmost (e.g. it was already open in background)
     if resolved_name and resolved_name.lower() != app_name.lower():
         return f"Launched {resolved_name} (matched from '{app_name}'). It may already have been open — use Cmd+Tab if it's not visible."
@@ -248,14 +251,17 @@ async def close_window() -> str:
     if "error" in result.lower():
         return f"Failed to close window: {result}"
 
-    # Wait for window to close
-    await asyncio.sleep(0.5)
-
-    # Verify
-    after = await _osascript(
-        'tell application "System Events" to tell (first process whose frontmost is true) '
-        'to get {name of it, count of windows}'
-    )
+    # Wait for window to close — poll every 100ms, max 0.5s
+    after = before
+    _deadline = asyncio.get_event_loop().time() + 0.5
+    while asyncio.get_event_loop().time() < _deadline:
+        await asyncio.sleep(0.1)
+        after = await _osascript(
+            'tell application "System Events" to tell (first process whose frontmost is true) '
+            'to get {name of it, count of windows}'
+        )
+        if after != before:
+            break
 
     if before != after:
         return "Closed the frontmost window."
@@ -308,12 +314,17 @@ async def quit_app(app_name: str) -> str:
         )
         await asyncio.wait_for(proc.communicate(), timeout=5.0)
 
-    # Step 4: Wait briefly then verify it actually quit
-    await asyncio.sleep(1.0)
-    verify = await _osascript(
-        f'tell application "System Events" to (name of every process whose name is "{matched_name}")'
-    )
-    still_running = matched_name.lower() in verify.lower() if verify else False
+    # Step 4: Poll for quit — check every 150ms, max 1.0s
+    still_running = True
+    _deadline = asyncio.get_event_loop().time() + 1.0
+    while asyncio.get_event_loop().time() < _deadline:
+        await asyncio.sleep(0.15)
+        verify = await _osascript(
+            f'tell application "System Events" to (name of every process whose name is "{matched_name}")'
+        )
+        still_running = matched_name.lower() in verify.lower() if verify else False
+        if not still_running:
+            break
 
     if still_running:
         # Step 5: Force kill as last resort
@@ -323,11 +334,18 @@ async def quit_app(app_name: str) -> str:
             stderr=asyncio.subprocess.PIPE,
         )
         await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        await asyncio.sleep(0.5)
-        verify2 = await _osascript(
-            f'tell application "System Events" to (name of every process whose name is "{matched_name}")'
-        )
-        if matched_name.lower() in verify2.lower():
+        # Poll for force-kill — every 100ms, max 0.5s
+        _still = True
+        _deadline2 = asyncio.get_event_loop().time() + 0.5
+        while asyncio.get_event_loop().time() < _deadline2:
+            await asyncio.sleep(0.1)
+            verify2 = await _osascript(
+                f'tell application "System Events" to (name of every process whose name is "{matched_name}")'
+            )
+            _still = matched_name.lower() in verify2.lower() if verify2 else False
+            if not _still:
+                break
+        if _still:
             return f"Failed to quit {matched_name} — it refused to close even after force-kill."
         return f"Force-quit {matched_name} (it didn't respond to the normal quit)."
 
@@ -504,12 +522,29 @@ async def run_shortcut(keys: str) -> str:
     if "error" in result.lower():
         return f"Failed to run shortcut: {result}"
 
-    # ── Wait for overlay to fade (macOS shortcut overlay lasts ~0.5-1s) ──
-    # At t=1.5s the overlay is guaranteed gone; only persistent UI changes remain.
-    await asyncio.sleep(1.5)
-
-    after_hash = await _screen_hash()
-    after_wins = _window_ids()
+    # ── Wait for overlay to fade — poll every 200ms, max 1.5s ──
+    # macOS shortcut overlay lasts ~0.5-1s. We poll for persistent changes.
+    after_hash = before_hash
+    after_wins = before_wins
+    _deadline = asyncio.get_event_loop().time() + 1.5
+    _settled_count = 0
+    _prev_check_hash = None
+    while asyncio.get_event_loop().time() < _deadline:
+        await asyncio.sleep(0.2)
+        after_hash = await _screen_hash()
+        after_wins = _window_ids()
+        # If new window appeared, exit immediately
+        if after_wins - before_wins:
+            break
+        # If screen changed and stayed changed for 2 consecutive checks → settled
+        if after_hash and after_hash != before_hash:
+            if after_hash == _prev_check_hash:
+                _settled_count += 1
+                if _settled_count >= 1:
+                    break
+            else:
+                _settled_count = 0
+        _prev_check_hash = after_hash
 
     # New layer-0 window? Definitive success (new dialog/modal/window opened)
     new_wins = after_wins - before_wins
@@ -1151,7 +1186,10 @@ async def wait(seconds: float = 1.0) -> str:
 
 # ── 13. run_shell (execute terminal commands) ──
 
-# Safety blocklist — reject commands containing these patterns
+import re as _re
+
+# Safety blocklist — reject commands containing these patterns.
+# Uses both exact substring matches and regex patterns for robustness.
 SHELL_BLOCKLIST = [
     "rm -rf /", "rm -rf ~", "rm -rf /*",
     "sudo rm", "sudo shutdown", "sudo reboot", "sudo halt",
@@ -1159,6 +1197,31 @@ SHELL_BLOCKLIST = [
     "mkfs", "dd if=", ":(){ :|:& };:",
     "mv / ", "chmod -R 777 /",
     "> /dev/sda", "fork bomb",
+]
+
+# Regex patterns for more robust detection (case-insensitive)
+SHELL_BLOCKLIST_RE = [
+    _re.compile(r"\brm\s+(-\w+\s+)*(/|~|\$HOME)\b", _re.IGNORECASE),           # rm with root/home
+    _re.compile(r"\bsudo\s+(rm|shutdown|reboot|halt|mkfs|dd)\b", _re.IGNORECASE), # sudo + destructive
+    _re.compile(r"\b(format|fdisk|diskutil\s+erase)\b", _re.IGNORECASE),          # disk formatting
+    _re.compile(r">\s*/dev/(sd|disk|nvme)", _re.IGNORECASE),                       # overwrite device
+    _re.compile(r"\bcurl\b.*\|\s*(ba)?sh", _re.IGNORECASE),                       # curl pipe to shell
+    _re.compile(r"\bwget\b.*\|\s*(ba)?sh", _re.IGNORECASE),                       # wget pipe to shell
+    _re.compile(r"\blaunchctl\s+(unload|remove)\b", _re.IGNORECASE),              # system service removal
+    _re.compile(r"\bdefaults\s+delete\b", _re.IGNORECASE),                        # macOS defaults nuke
+]
+
+# Paths that read_file/write_file should never access
+RESTRICTED_PATH_PREFIXES = [
+    os.path.expanduser("~/.ssh"),
+    os.path.expanduser("~/.gnupg"),
+    os.path.expanduser("~/.aws"),
+    os.path.expanduser("~/.kube"),
+    "/etc/shadow",
+    "/etc/sudoers",
+    "/System",
+    "/usr/local/bin",
+    "/private/var",
 ]
 
 @registry.register(
@@ -1176,11 +1239,17 @@ SHELL_BLOCKLIST = [
     }
 )
 async def run_shell(command: str) -> str:
-    # Safety check
+    # Safety check — substring blocklist
     cmd_lower = command.lower().strip()
     for blocked in SHELL_BLOCKLIST:
         if blocked in cmd_lower:
             return f"BLOCKED: Command contains dangerous pattern '{blocked}'. Refusing to execute."
+
+    # Safety check — regex blocklist (catches obfuscated variants)
+    for pattern in SHELL_BLOCKLIST_RE:
+        match = pattern.search(command)
+        if match:
+            return f"BLOCKED: Command matches dangerous pattern. Refusing to execute."
 
     try:
         proc = await asyncio.create_subprocess_shell(
@@ -1257,6 +1326,154 @@ _screen_cache = {"hash": None, "result": None}
 # click_element adds this to image-relative coordinates so clicks land correctly
 # on multi-monitor setups where secondary displays have non-zero origins.
 _display_origin = {"x": 0, "y": 0}
+
+# ── Accessibility timeout circuit breaker ──
+# Apps whose UI tree dump consistently times out (WhatsApp, Electron apps).
+# Skip re-querying them so we fail-fast into the visual fallback instead
+# of wasting 8-16 s on AppleScript timeouts.
+_ui_tree_timeout_apps: dict = {}  # {app_lower: timestamp_of_last_timeout}
+_UI_TREE_TIMEOUT_COOLDOWN = 60.0  # seconds before retrying a timed-out app
+
+
+async def _fast_visual_locate(
+    description: str,
+    hint: str = "",
+) -> Optional[tuple]:
+    """Find a UI element visually using Gemini Flash (~3-5 s).
+
+    Captures a screenshot, sends it to the *Flash* model with a focused
+    prompt asking only for the element's (x, y) centre coordinates.
+
+    Returns
+    -------
+    (x, y) pixel coordinates usable with `click_element`, or None.
+
+    Cost: ~860 tokens (image + short prompt) at Flash pricing — negligible.
+    """
+    global _display_origin
+
+    screenshot_dir = os.path.join(tempfile.gettempdir(), "moonwalk")
+    os.makedirs(screenshot_dir, exist_ok=True)
+    fpath = os.path.join(screenshot_dir, f"vfind_{int(time.time())}.png")
+
+    try:
+        # ── 1. Detect active display (reuse Quartz logic from read_screen) ──
+        display_num = 1
+        logical_w, logical_h = None, None
+        origin_x, origin_y = 0, 0
+        try:
+            if Quartz:
+                max_d = 16
+                err, ids, _ = Quartz.CGGetActiveDisplayList(max_d, None, None)
+                if err == 0 and ids:
+                    wl = Quartz.CGWindowListCopyWindowInfo(
+                        Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
+                        Quartz.kCGNullWindowID,
+                    )
+                    cx, cy = 0, 0
+                    for w in (wl or []):
+                        if w.get("kCGWindowLayer", 999) == 0 and w.get("kCGWindowOwnerName") != "Window Server":
+                            b = w.get("kCGWindowBounds", {})
+                            cx = b.get("X", 0) + b.get("Width", 0) / 2
+                            cy = b.get("Y", 0) + b.get("Height", 0) / 2
+                            break
+                    r0 = Quartz.CGDisplayBounds(ids[0])
+                    logical_w = int(r0.size.width)
+                    logical_h = int(r0.size.height)
+                    for i, did in enumerate(ids):
+                        r = Quartz.CGDisplayBounds(did)
+                        if (r.origin.x <= cx < r.origin.x + r.size.width and
+                                r.origin.y <= cy < r.origin.y + r.size.height):
+                            display_num = i + 1
+                            logical_w = int(r.size.width)
+                            logical_h = int(r.size.height)
+                            origin_x = int(r.origin.x)
+                            origin_y = int(r.origin.y)
+                            break
+        except Exception:
+            pass
+
+        _display_origin = {"x": origin_x, "y": origin_y}
+
+        # ── 2. Capture screenshot ──
+        proc = await asyncio.create_subprocess_exec(
+            "screencapture", "-x", "-D", str(display_num), "-t", "png", fpath,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=3.0)
+        if not os.path.exists(fpath):
+            return None
+
+        # ── 3. Resize to logical resolution + encode JPEG ──
+        import io as _io
+        try:
+            from PIL import Image
+            img = Image.open(fpath).convert("RGB")
+            os.remove(fpath)
+            if logical_w and logical_h and img.size != (logical_w, logical_h):
+                img = img.resize((logical_w, logical_h), Image.LANCZOS)
+            buf = _io.BytesIO()
+            img.save(buf, format="JPEG", quality=70)
+            img_bytes = buf.getvalue()
+        except ImportError:
+            with open(fpath, "rb") as f:
+                img_bytes = f.read()
+            os.remove(fpath)
+
+        # ── 4. Ask Flash to locate the element ──
+        from google import genai
+        from google.genai import types as _gtypes
+
+        client = genai.Client()
+        res_hint = ""
+        if logical_w and logical_h:
+            res_hint = f" Image is {logical_w}×{logical_h}. Coordinates are pixels from top-left."
+        prompt = (
+            f"Find the UI element best described as: '{description}'"
+            f"{(' (context: ' + hint + ')') if hint else ''}.{res_hint}\n"
+            f"Return ONLY the pixel coordinates of its CENTER as two integers: x,y\n"
+            f"If you cannot find it, return exactly: NOTFOUND"
+        )
+
+        response = client.models.generate_content(
+            model=os.environ.get("GEMINI_FAST_MODEL", "gemini-3-flash-preview"),
+            contents=[
+                _gtypes.Content(
+                    role="user",
+                    parts=[
+                        _gtypes.Part.from_text(text=prompt),
+                        _gtypes.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+                    ],
+                )
+            ],
+        )
+
+        text = ""
+        if response and response.candidates and response.candidates[0].content:
+            for part in response.candidates[0].content.parts:
+                if part.text:
+                    text += part.text
+
+        text = text.strip()
+        if "NOTFOUND" in text.upper():
+            print(f"[VisualLocate] ✗ '{description}' not found on screen")
+            return None
+
+        import re as _re_vl
+        m = _re_vl.search(r"(\d{1,5})\s*[,;x]\s*(\d{1,5})", text)
+        if m:
+            vx, vy = int(m.group(1)), int(m.group(2))
+            print(f"[VisualLocate] ✓ '{description}' found at ({vx}, {vy})")
+            return (vx, vy)
+
+        print(f"[VisualLocate] ✗ Could not parse coordinates from: {text[:80]}")
+        return None
+
+    except Exception as e:
+        print(f"[VisualLocate] ⚠ Error: {e}")
+        if os.path.exists(fpath):
+            os.remove(fpath)
+        return None
 
 @registry.register(
     name="read_screen",
@@ -2129,6 +2346,14 @@ async def _get_cached_ui_tree(app_name: str = "", search_term: str = "") -> tupl
     current_app = app_name or await get_active_app()
     current_title = await get_window_title()
 
+    # ── Timeout circuit breaker: skip apps whose tree consistently times out ──
+    app_lower = current_app.lower()
+    if app_lower in _ui_tree_timeout_apps:
+        cooldown_elapsed = now - _ui_tree_timeout_apps[app_lower]
+        if cooldown_elapsed < _UI_TREE_TIMEOUT_COOLDOWN:
+            print(f"[UI Tree] ⚡ Skipping {current_app} (timed out {cooldown_elapsed:.0f}s ago)")
+            return [], "SKIPPED: accessibility tree previously timed out for this app"
+
     # Check cache validity — same app+window and not expired
     cache_valid = (
         _ui_tree_cache["app"] == current_app
@@ -2144,6 +2369,12 @@ async def _get_cached_ui_tree(app_name: str = "", search_term: str = "") -> tupl
     else:
         raw = await get_ui_tree(app_name=app_name, search_term=search_term)
         elements = _parse_ui_elements(raw)
+
+        # Record timeout for circuit breaker
+        if "timed out" in raw.lower():
+            _ui_tree_timeout_apps[app_lower] = now
+            print(f"[UI Tree] ⏱ Timeout recorded for {current_app} — will skip for {_UI_TREE_TIMEOUT_COOLDOWN:.0f}s")
+
         # Only update cache for unfiltered queries
         if not search_term:
             _ui_tree_cache.update({
@@ -2284,28 +2515,36 @@ async def click_ui(description: str, app_name: str = "", click_type: str = "sing
 
         # 1) Search accessibility tree
         elements, raw = await _get_cached_ui_tree(app_name=app_name, search_term=description)
-        if not elements:
+        timed_out = "timed out" in (raw or "").lower() or "skipped" in (raw or "").lower()
+        if not elements and not timed_out:
             elements, raw = await _get_cached_ui_tree(app_name=app_name, search_term="")
 
-        if not elements:
-            return (
-                f"No UI element matching '{description}' found in the accessibility tree. "
-                f"The element may not be visible, or the app may not expose it via Accessibility. "
-                f"Try read_screen as a fallback to visually locate it."
-            )
+        # 2) Find best match from accessibility tree
+        match = _best_match(elements, description) if elements else None
 
-        # 2) Find best match
-        match = _best_match(elements, description)
         if not match:
-            # Return what we DID find so the agent can pick
-            found_names = [e["name"] for e in elements[:10] if e["name"] != "unnamed"]
+            # 3) Visual fallback — find the element on screen using Gemini Flash
+            print(f"[click_ui] Accessibility miss for '{description}', trying visual fallback…")
+            coords = await _fast_visual_locate(
+                description,
+                hint=f"in the {app_name} app" if app_name else "",
+            )
+            if coords:
+                vx, vy = coords
+                click_result = await click_element(x=vx, y=vy, click_type=click_type)
+                return (
+                    f"Visually located '{description}' at ({vx}, {vy}) and clicked [{click_type}]. "
+                    f"{click_result}"
+                )
+            # Both accessibility and visual failed
+            found_names = [e["name"] for e in elements[:10] if e.get("name") and e["name"] != "unnamed"] if elements else []
             return (
-                f"No close match for '{description}'. "
-                f"Available elements: {', '.join(found_names) if found_names else 'none with names'}. "
-                f"Try a different description or use read_screen."
+                f"No UI element matching '{description}' found (tried accessibility API + visual fallback). "
+                f"{'Available elements: ' + ', '.join(found_names) + '. ' if found_names else ''}"
+                f"Try a more specific description or use read_screen."
             )
 
-        # 3) Click the center of the matched element
+        # 4) Click the center of the matched element
         cx, cy = match["cx"], match["cy"]
         click_result = await click_element(x=cx, y=cy, click_type=click_type)
 
@@ -2356,40 +2595,46 @@ async def type_in_field(field_description: str, text: str, app_name: str = "", c
     try:
         await _activate_target_app(app_name)
 
-        # 1) Find the field
-        elements, _ = await _get_cached_ui_tree(app_name=app_name, search_term=field_description)
-        if not elements:
-            elements, _ = await _get_cached_ui_tree(app_name=app_name, search_term="")
+        # 1) Find the field via accessibility API
+        elements, raw = await _get_cached_ui_tree(app_name=app_name, search_term=field_description)
+        timed_out = "timed out" in (raw or "").lower() or "skipped" in (raw or "").lower()
+        if not elements and not timed_out:
+            elements, raw = await _get_cached_ui_tree(app_name=app_name, search_term="")
 
         # Prefer text-input roles
         input_roles = {"AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"}
         input_elements = [e for e in elements if e["role"] in input_roles]
         search_pool = input_elements if input_elements else elements
 
-        if not search_pool:
-            return (
-                f"No text field matching '{field_description}' found. "
-                f"Try read_screen to visually locate the field."
-            )
-
-        match = _best_match(search_pool, field_description)
-        if not match:
-            # Fall back to first input element if any
-            if input_elements:
+        match = None
+        if search_pool:
+            match = _best_match(search_pool, field_description)
+            if not match and input_elements:
                 match = _fallback_input_match(input_elements, field_description)
-            else:
-                found_names = [e["name"] for e in elements[:10] if e["name"] != "unnamed"]
+
+        # 2) If accessibility found a match, click it
+        if match:
+            cx, cy = match["cx"], match["cy"]
+        else:
+            # 3) Visual fallback — find the field using Gemini Flash
+            print(f"[type_in_field] Accessibility miss for '{field_description}', trying visual fallback…")
+            coords = await _fast_visual_locate(
+                f"'{field_description}' text field or input area",
+                hint=f"in the {app_name} app" if app_name else "",
+            )
+            if not coords:
                 return (
-                    f"No text field matching '{field_description}'. "
-                    f"Visible elements: {', '.join(found_names) if found_names else 'none'}."
+                    f"No text field matching '{field_description}' found "
+                    f"(tried accessibility API + visual fallback). "
+                    f"Try click_ui on the target area first, then type_text."
                 )
+            cx, cy = coords
 
-        # 2) Click the field to focus it
-        cx, cy = match["cx"], match["cy"]
+        # 4) Click the field to focus it
         await click_element(x=cx, y=cy)
-        await asyncio.sleep(0.15)  # let focus settle
+        await asyncio.sleep(0.2)  # let focus settle
 
-        # 3) Optionally clear existing content
+        # 5) Optionally clear existing content
         if clear_first:
             await _osascript(
                 'tell application "System Events" to keystroke "a" using command down'
@@ -2400,11 +2645,12 @@ async def type_in_field(field_description: str, text: str, app_name: str = "", c
             )
             await asyncio.sleep(0.05)
 
-        # 4) Type the text
+        # 6) Type the text
         result = await type_text(text)
 
+        source = f"[{match['role']}] \"{match['name']}\"" if match else f"(visual) '{field_description}'"
         return (
-            f"Clicked [{match['role']}] \"{match['name']}\" at ({cx}, {cy}), "
+            f"Clicked {source} at ({cx}, {cy}), "
             f"then typed {len(text)} chars. {result}"
         )
 
@@ -2750,3 +2996,91 @@ async def capture_region_screenshot(x: int, y: int, width: int, height: int) -> 
         })
     except Exception as e:
         return f"ERROR: {str(e)[:200]}"
+
+
+# ═══════════════════════════════════════════════════════════════
+#  send_imessage — visual iMessage via AppleScript
+# ═══════════════════════════════════════════════════════════════
+
+@registry.register(
+    name="send_imessage",
+    description=(
+        "Send an iMessage to a contact via the macOS Messages app. "
+        "Opens Messages visually so the user can see the message being sent. "
+        "The recipient can be a phone number (with country code) or an email "
+        "address registered with iMessage."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "recipient": {
+                "type": "string",
+                "description": (
+                    "Phone number (e.g. '+447700900000') or email address "
+                    "of the iMessage recipient."
+                ),
+            },
+            "message": {
+                "type": "string",
+                "description": "The text message to send.",
+            },
+        },
+        "required": ["recipient", "message"],
+    },
+    timeout=15.0,
+)
+async def send_imessage(recipient: str, message: str) -> str:
+    """Send an iMessage visually via the macOS Messages app."""
+    recipient = (recipient or "").strip()
+    message = (message or "").strip()
+    if not recipient:
+        return json.dumps({"ok": False, "error": "Recipient is required."})
+    if not message:
+        return json.dumps({"ok": False, "error": "Message text is required."})
+    if len(message) > 5000:
+        message = message[:5000]
+
+    # Bring Messages.app to the foreground so the user sees it
+    await _activate_target_app("Messages")
+    await asyncio.sleep(0.5)
+
+    safe_recipient = _escape_applescript_string(recipient)
+    safe_message = _escape_applescript_string(message)
+
+    script = f'''
+    tell application "Messages"
+        set targetService to 1st account whose service type = iMessage
+        set targetBuddy to participant "{safe_recipient}" of targetService
+        send "{safe_message}" to targetBuddy
+    end tell
+    '''
+
+    try:
+        result = await _osascript(script)
+        if "error" in result.lower():
+            # Fallback: try using the buddy approach
+            fallback_script = f'''
+            tell application "Messages"
+                set targetService to 1st service whose service type = iMessage
+                set theBuddy to buddy "{safe_recipient}" of targetService
+                send "{safe_message}" to theBuddy
+            end tell
+            '''
+            result = await _osascript(fallback_script)
+            if "error" in result.lower():
+                return json.dumps({
+                    "ok": False,
+                    "error": f"Failed to send iMessage: {result[:200]}",
+                    "hint": "Check that the recipient has iMessage enabled and is a valid phone/email.",
+                })
+
+        return json.dumps({
+            "ok": True,
+            "message": f"Sent iMessage to {recipient}",
+            "preview": message[:100],
+        })
+    except Exception as e:
+        return json.dumps({
+            "ok": False,
+            "error": f"iMessage send failed: {str(e)[:200]}",
+        })

@@ -33,14 +33,12 @@ from agent.planner import ExecutionStep, StepStatus
 from agent.planner import MilestonePlan, Milestone, MilestoneStatus
 from agent.task_planner import TaskPlanner
 from agent.verifier import get_verifier
-from agent.vision_recovery import attempt_vision_recovery, should_attempt_vision_recovery
-from agent.memory import ConversationMemory, UserPreferences, TaskStore, UserProfile, WorkingMemory
-from tools.selector import get_tool_selector, set_tool_gateway_context
+from agent.memory import ConversationMemory, UserPreferences, TaskStore, UserProfile, WorkingMemory, VaultMemory
+from tools.selector import get_tool_selector, set_tool_gateway_context, set_web_progress_callback
 from tools import registry as tool_registry
 from providers.router import ModelRouter
 from providers import LLMProvider
 import agent.perception as perception
-from runtime_state import runtime_state_store
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -52,8 +50,8 @@ PENDING_PLAN_TTL_SECONDS = 600
 # Browser timing — seconds to wait after navigation actions so the page
 # has time to load and the snapshot can be refreshed.  Centralised here
 # instead of scattered as magic numbers throughout _execute_step().
-BROWSER_NAV_SETTLE_S = 1.5      # after web_search / click / open_url
-BROWSER_RECOVERY_SETTLE_S = 0.5 # after refresh_refs recovery
+BROWSER_NAV_SETTLE_S = 0.3      # reduced — snapshot event-wait handles the real delay
+BROWSER_RECOVERY_SETTLE_S = 0.2 # after refresh_refs recovery
 
 BROWSER_APP_NAMES = {
     "google chrome",
@@ -95,156 +93,7 @@ WEB_FLOW_TOOLS = {
 }
 
 # Simplified system prompt for V2 (planning is done separately)
-SYSTEM_PROMPT_V2 = """You are Moonwalk, a fast and helpful macOS desktop AI assistant.
-
-## Understanding the User
-
-You receive VOICE-TRANSCRIBED text — expect misspellings, homophones, and dropped words.
-Always infer the most plausible intent given the desktop context.
-
-### Pronoun & Reference Resolution
-- "it", "this", "that" → resolve against: (1) conversation history, (2) the active app/window/page, (3) the most recently mentioned entity.
-- "do it", "go ahead", "yes" → execute whatever was just proposed in conversation history.
-- When the context resolves the ambiguity, **act — don't ask for clarification.**
-
-### Context Interpretation
-Every request arrives with a `[Desktop Context]` block. USE IT:
-- **Active App** tells you what the user is working in. Route tool calls accordingly.
-- **Window Title** reveals the specific document, tab, or page.
-- **Browser URL** tells you the exact site for web page interactions.
-- **Page Content / Selected Text** shows what the user is looking at.
-- **Clipboard** shows what was recently copied.
-
-## Response Calibration
-
-Match response length to the request type:
-- **Actions** (open, close, click): 1 short sentence.
-- **Quick answers**: 1-2 sentences.
-- **Knowledge / explanations / math / code**: As detailed as needed. Don't truncate.
-- **Math**: Use LaTeX — `$x^2$` inline, `$$\\frac{a}{b}$$` for display blocks. The UI renders KaTeX.
-
-## Capabilities
-- You know the current date and time from the Desktop Context — NEVER call `run_shell("date")`. Use context for "next week", "tomorrow", etc.
-- Control apps, browse web, run terminal commands, read/write files
-- Automate UI (click, type, shortcuts), manage windows, clipboard
-
-## Tab Awareness (CRITICAL — prevent duplicate tabs)
-Before opening ANY URL with `open_url`, ALWAYS check if it's already open:
-1. `open_url` automatically checks known tabs. But if you're about to open a site you already visited this session, use `browser_switch_tab` instead.
-2. `browser_list_tabs` returns all known open tabs — use it when uncertain.
-3. Your Working Memory (below) shows URLs you already opened. NEVER re-open them.
-4. When the user says "go to X" and X is already open, SWITCH — don't open a new tab.
-5. For Google Workspace: use API tools (`gdocs_create`, etc.) instead of opening docs.new/sheets.new URLs.
-
-## Working Memory
-You have access to a working memory that tracks what you've done this session. Check it before repeating actions.
-The [Recent Actions] and [Session Entities] blocks in your context show your history — use them to:
-- Avoid re-opening URLs already opened
-- Avoid re-running searches already completed
-- Reference documents you already created (use their URLs)
-- Continue multi-step tasks without losing context
-
-## Browser Scrolling (CRITICAL)
-- **NEVER** use `press_key` to scroll web pages. `press_key(down/up/Page_Down)` scrolls the OS-level focus target (which is often the Electron app, not the browser page content). It will NOT move the web page.
-- **ALWAYS** use `browser_scroll(direction, amount)` to scroll browser pages. It scrolls the actual DOM, captures a fresh snapshot, and returns the new scroll position.
-- `browser_scroll` returns `scroll_y`, `page_height`, and `at_bottom`. Check `at_bottom` to know when you've reached the end of the page.
-- `browser_read_page` also returns `scroll_y`, `page_height`, `at_bottom` — use these to decide if scrolling is needed.
-- If `at_bottom` is true, **stop scrolling** — there's no more content below.
-- If `browser_read_page` shows the same content after scrolling, the page may be dynamically loaded — try `browser_refresh_refs` or `browser_read_page(refresh=true)` to force a fresh snapshot.
-- Scroll workflow: `browser_read_page` → check content → `browser_scroll("down")` → `browser_read_page` → repeat until found or `at_bottom`.
-
-## UI Interaction Rules (CRITICAL)
-1. Click buttons/links/menus: `click_ui(description="...")` — Accessibility API, exact coordinates
-2. Type in fields: `type_in_field(field_description="...", text="...")` — auto-finds and focuses
-3. Web pages: use `browser_read_page()` to see page content (products, prices, results, text) — it's instant and returns scroll position. Use `browser_click_match(query="...")` for fast clicks. Use `browser_scroll(direction="down")` to scroll pages — NEVER `press_key`. `browser_find` is a SLOW fallback — avoid unless `browser_read_page` + `browser_click_ref` can't resolve
-4. `read_screen` is ONLY for observation ("what's on my screen?") — NEVER for click coordinates
-5. `browser_click`/`browser_fill` are legacy — only when user provides CSS/XPath selectors
-6. NEVER use `run_shell` for browser/UI automation — only for real system/file/terminal tasks
-
-## Google Workspace Rules (CRITICAL)
-For Google Docs, Sheets, Slides, Drive, Gmail, and Calendar — ALWAYS prefer the dedicated `g*` tools:
-- **Docs**: `gdocs_create` / `gdocs_read` / `gdocs_append` / `gdocs_insert_image` — create and populate long documents directly, no browser clicking required.
-- **Sheets**: `gsheets_create` / `gsheets_read` / `gsheets_write` / `gsheets_append_rows` / `gsheets_formula` — write hundreds of rows at once; pass 2D arrays, not one cell at a time.
-- **Slides**: `gslides_create` / `gslides_add_slide` — build presentations slide-by-slide with title+body.
-- **Drive**: `gdrive_search` / `gdrive_upload` — find or upload any file.
-- **Gmail**: `gmail_send` / `gmail_read` / `gmail_draft` — send, search, and draft emails directly.
-- **Calendar**: `gcal_create_event` / `gcal_list_events` — schedule events and list agenda.
-- **Analysis**: `gworkspace_analyze` — read and summarise any open Google Workspace document without copy-paste; stores structured content in memory.
-
-**⚠️ MANDATORY**: When creating or writing Google Docs/Sheets/Slides content, you MUST use these API tools — NEVER use `type_text`, `browser_click_match`, or `browser_type_ref` to type into a Google Workspace editor.
-- To create a new document: `gdocs_create` (NOT `open_url('docs.new')` + `type_text`)
-- To add content: `gdocs_append` (NOT `browser_click_match('editing area')` + `type_text`)
-- To read content: `gdocs_read` or `gworkspace_analyze` (NOT `browser_read_page`)
-Browser automation for Google Workspace is ONLY for UI actions the API can't do (e.g. clicking formatting toolbar buttons, sharing dialogs).
-
-## User Replies
-User replies after `await_reply` are INSTRUCTIONS, not literal text. Interpret intent, fix transcription errors, compose polished text.
-
-## Image Tools (copy / paste images across apps)
-You can copy images from the web or screen and paste them into any app:
-- **`save_image(url)`** — download an image from a URL to a temp file. Returns the local path.
-- **`copy_image_to_clipboard(source)`** — copy an image onto the clipboard. `source` can be a URL or a local file path. Once copied, use `clipboard_ops(action='paste')` to paste it into any app.
-- **`capture_region_screenshot(x, y, width, height)`** — capture a rectangular screen region to a file. Good for grabbing charts, diagrams, or UI elements.
-- **`browser_copy_image(ref_id?, query?)`** — copy an image from the current browser page to clipboard. Use ref_id from `browser_read_page` or describe the image with query.
-- **`clipboard_ops(action='set_image', image_path='...')`** — directly load a local image file onto the clipboard.
-- **`gdocs_insert_image(document_id, image_url)`** — insert an image into Google Docs (requires PUBLIC URL).
-
-### Image Workflow Patterns:
-1. **Web image → any app**: `copy_image_to_clipboard(url)` → `clipboard_ops(paste)` → done
-2. **Browser page image → any app**: `browser_copy_image(query="the logo")` → `clipboard_ops(paste)`
-3. **Screen region → any app**: `capture_region_screenshot(x,y,w,h)` → `copy_image_to_clipboard(path)` → `clipboard_ops(paste)`
-4. **Web image → Google Docs**: `gdocs_insert_image(doc_id, public_url)` (direct API, no clipboard needed)
-- "proceed", "go ahead", "yes", "do it", "approved", "start" → The user has APPROVED a plan. Now execute ALL the steps you proposed. Do NOT call `await_reply` again during execution. Do NOT pause between steps. Run every step in a single plan and call `send_response` only once at the very end with the result.
-- If the user requests MODIFICATIONS ("change step 2", "skip the last one"), adjust the plan and execute the modified version.
-- "cancel", "nevermind", "stop" → Abort. Call `send_response` with a short acknowledgment.
-
-## Communication
-- `send_response`: Final answer (conversation ends). ONLY call when the task is FULLY complete.
-  - One-shot tasks ("open YouTube"): bundle send_response with the action.
-  - Multi-step tasks ("find cheapest X", "search for Y"): do NOT send_response until you have the answer. Keep iterating.
-- `await_reply`: Ask a question and wait for spoken response. NEVER use `await_reply` as a progress update or status message — that's what the "doing" websocket state is for (it happens automatically).
-- NEVER output conversational text directly — ALWAYS use one of these tools
-
-## Plan Approval → Execution Flow
-When you present a `plan` modal via `await_reply` and the user approves:
-1. Generate a COMPLETE execution plan with ALL steps. Include every tool call needed.
-2. Do NOT call `await_reply` between steps — the UI shows "doing" state automatically for each tool.
-3. Only call `send_response` ONCE at the very end (with `steps` modal to summarize what you did, or `text` for a short confirmation).
-4. If something fails mid-execution, use `send_response` to report the error.
-
-## Response Modal Types (IMPORTANT)
-Both `send_response` and `await_reply` accept a `modal` parameter. Pick the best layout for the content:
-- **text** (default): short answers, 1-3 sentences. No extra params needed.
-- **rich**: long-form content (essays, reports, explanations). Add `title`. Use full markdown.
-- **table**: structured data (comparisons, stats, spreadsheets). Provide `headers` and `rows`.
-- **list**: multiple items (search results, recommendations). Provide `items` [{title, description, icon?}].
-- **confirm**: ask user to choose. Provide `actions` [{label, value}]. Stays until user clicks.
-- **media**: show an image or screenshot. Provide `media_url` and optional `caption`.
-- **steps**: summarise a multi-step workflow you completed. Provide `steps` [{label, status: done|current|pending, detail?}].
-- **plan**: present your proposed plan BEFORE acting. Provide `steps` [{label, detail?}]. Use with `await_reply`. The user sees the step rows with a Proceed button and can approve or dismiss (X). The plan modal has NO header — it only shows numbered step rows. If context is needed, use multi-modal to pair a text bubble above it.
-- **cards**: display visual image+text cards for research results, products, homes, articles, etc. Provide `cards` [{name, description?, image?, price?, rating?, reviews?, source?, url?, link?, link_label?}]. Also accepts `title` and `subtitle`. Each card shows image on the left with text on the right. The `url`/`link` param makes the card clickable and adds a "View" pill. `link_label` customizes the pill text (default "View"). Best for: product comparisons, home listings, research results, articles, any visual collection. Backward-compatible as `modal: 'products'` with `products` array.
-
-### Multi-Modal Stacking
-Use the `modals` parameter (array) to show MULTIPLE bubbles stacked vertically.
-Each entry is a complete modal definition with its own `modal` type and fields.
-Example: `modals: [{modal: "text", message: "Here's my plan:"}, {modal: "plan", message: "", steps: [...]}]`
-The plan modal is headerless by design — pair it with a text bubble for descriptions when needed. When the plan is self-explanatory, just send it standalone.
-
-### Persistent Modals
-Plan and confirm modals stay on screen until the user interacts (they do NOT auto-dismiss). Other modals auto-dismiss after a timeout.
-
-### Modal Selection Rules:
-- If the task is **complex (3+ steps) and could have side effects** → use `plan` with `await_reply` first, then execute after approval
-- If you found **products, homes, listings, or visual results** → use `cards`
-- If you found **3+ comparable items** (flights, hotels, stats) → use `table`
-- If you did **3+ sequential actions** → use `steps` to summarise what you did
-- If the answer is **a paragraph or more** → use `rich` with a `title`
-- If you need the user to **choose between options** → use `confirm`
-- If you captured a **screenshot** or have an **image** → use `media`
-- If you have **a list of results** (links, apps, files) → use `list`
-- Short confirmations ("Done!", "Opened YouTube") → use `text` (default)"""
-
-SYSTEM_PROMPT_V2_COMPACT = """You are Moonwalk, a macOS desktop assistant.
+SYSTEM_PROMPT_V2 = """You are Moonwalk, a macOS desktop assistant.
 
 ## Reasoning Protocol (MANDATORY)
 Before EVERY tool call you MUST include a `reasoning` argument — one sentence
@@ -280,7 +129,6 @@ Communication rules:
 - `await_reply` is only for a true blocking question.
 - Do not emit raw conversational text outside these tools.
 """
-SYSTEM_PROMPT_V2 = SYSTEM_PROMPT_V2_COMPACT
 
 # WebSocket callback type
 WSCallback = Callable[[dict], Awaitable[None]]
@@ -349,6 +197,7 @@ class MoonwalkAgentV2:
         self.user_profile = UserProfile()
         self.task_store = TaskStore()
         self.working_memory = WorkingMemory(max_actions=40, max_entities=60)
+        self.vault = VaultMemory()
         
         # Routing
         self.router = ModelRouter()
@@ -363,12 +212,7 @@ class MoonwalkAgentV2:
         self._pending_plan: Optional[PendingPlanState] = None
         self._pending_execution: Optional[PendingExecutionState] = None
         self._last_opened_url: str = ""
-
-        # Perception cache: (timestamp, env_dict) — shared across the current
-        # milestone run. Invalidated whenever a UI-mutating tool executes.
-        self._perception_cache: Optional[tuple[float, dict]] = None
-        self._perception_cache_valid: bool = False
-
+        
         # Configuration
         self.use_planning = use_planning
 
@@ -385,6 +229,10 @@ class MoonwalkAgentV2:
         wm = self.working_memory.to_prompt_string()
         if wm:
             prompt += f"\n\n{wm}"
+        # Inject vault memory summary (permanent cross-session knowledge)
+        vault_summary = self.vault.to_prompt_string()
+        if vault_summary:
+            prompt += f"\n\n{vault_summary}"
         return prompt
 
     def _context_fingerprint(self, context: perception.ContextSnapshot) -> dict:
@@ -775,7 +623,6 @@ class MoonwalkAgentV2:
         print(f"\n[AgentV2] ═══ New Request ═══")
         print(f"[AgentV2] Text: '{user_text}'")
         print(f"[AgentV2] Context: app={context.active_app}, title={context.window_title}")
-        runtime_state_store.start_request(query=user_text)
 
         # Record user turn in conversation memory (for multi-turn context)
         self.conversation.add_user(user_text)
@@ -802,6 +649,8 @@ class MoonwalkAgentV2:
             browser_has_snapshot=gateway_context["browser_has_snapshot"],
             browser_session_id=gateway_context["browser_session_id"],
         )
+        # Wire live progress updates from web gateway → Electron overlay
+        set_web_progress_callback(ws_callback)
         print(f"[AgentV2] Intent: {world_state.intent.action.value if world_state.intent else 'unknown'}")
 
         planning_request = user_text
@@ -863,6 +712,16 @@ class MoonwalkAgentV2:
                         "User follow-up:\n"
                         + "\n".join(resume_inputs)
                     )
+
+                # Preserve the original intent from the pending execution so the
+                # tool selector doesn't re-classify the follow-up text as a
+                # different intent (e.g. 'analyze' instead of 'communicate').
+                if pending_execution.plan and pending_execution.plan.milestones:
+                    original_intent = self.intent_parser.parse(
+                        pending_execution.original_user_request
+                    )
+                    if original_intent and original_intent.action != IntentAction.UNKNOWN:
+                        world_state.intent = original_intent
 
                 selected_tools, llm_tool_declarations = self._select_tool_surface(
                     resume_request,
@@ -1054,6 +913,9 @@ class MoonwalkAgentV2:
             self._pending_reply_provider = None
             print(f"[AgentV2] Resuming with {provider.name}")
         else:
+            # Immediate feedback while routing LLM runs
+            if ws_callback:
+                await ws_callback({"type": "doing", "text": "Analyzing request…", "tool": "router"})
             try:
                 decision = await self.router.route(
                     planning_request,
@@ -1083,20 +945,19 @@ class MoonwalkAgentV2:
         )
 
         # ══════════════════════════════════════════════════════════════
-        # PHASE 2: PLAN — Generate execution plan
+        # PHASE 2: PLAN — Generate execution plan (parallelised)
         # ══════════════════════════════════════════════════════════════
-        # Build a short conversation summary for the tool selector.
-        # Critical for follow-ups like "proceed" after a plan — without this,
-        # the selector only sees "proceed" and loses the original intent
-        # (e.g. "create a Google Doc"), so specialised tools get dropped.
+        # Tool selection is CPU-only (deterministic, ~0ms).  We run it
+        # first so its result feeds into the LLM planning call.
         selected_tools, llm_tool_declarations = self._select_tool_surface(
             planning_request,
             context,
             world_state,
         )
 
+        # Stream progress immediately — don't wait for the LLM
         if ws_callback:
-            await ws_callback({"type": "doing", "text": "Planning milestones…", "tool": "planner"})
+            await ws_callback({"type": "doing", "text": "Planning…", "tool": "planner"})
 
         milestone_plan = await self.planner.create_milestone_plan(
             user_request=planning_request,
@@ -1149,6 +1010,10 @@ class MoonwalkAgentV2:
         # ══════════════════════════════════════════════════════════════
         # PHASE 3 & 4: ACT + VERIFY — Execute milestone plan
         # ══════════════════════════════════════════════════════════════
+        if ws_callback:
+            first_goal = milestone_plan.milestones[0].goal if milestone_plan.milestones else "Working"
+            await ws_callback({"type": "doing", "text": first_goal, "tool": "executor"})
+
         final_response, awaiting = await self._execute_milestone_plan(
             plan=milestone_plan,
             world_state=world_state,
@@ -1161,7 +1026,91 @@ class MoonwalkAgentV2:
 
         print(f"[AgentV2] ⏱ TOTAL: {_time.time() - t_start:.2f}s")
 
+        # ── Background memory curator: decide what to persist ──
+        asyncio.ensure_future(self._curate_vault(user_text, final_response))
+
         return (final_response, awaiting)
+
+    async def _curate_vault(self, user_text: str, agent_response: str) -> None:
+        """Background curator: review the conversation and decide what to persist.
+
+        Spawned as a fire-and-forget task after ``run()`` completes.
+        Uses a lightweight Flash call to judge whether any facts, contacts,
+        preferences, or research snippets from the exchange are worth storing
+        permanently in the vault.
+        """
+        try:
+            # Only curate if there's meaningful content
+            if not user_text or len(user_text.strip()) < 10:
+                return
+            if not agent_response or len(agent_response.strip()) < 20:
+                return
+
+            # Build a compact context for the curator prompt
+            recent_actions = self.working_memory.get_recent_actions(5)
+            action_summary = "; ".join(
+                f"{a.tool}→{str(a.result_summary or '')[:60]}"
+                for a in recent_actions
+            ) if recent_actions else "none"
+
+            curator_prompt = (
+                "You are a memory curator. Review this conversation exchange and decide "
+                "if anything should be permanently stored in the user's vault memory.\n\n"
+                f"User said: {user_text[:500]}\n"
+                f"Agent response: {agent_response[:500]}\n"
+                f"Recent actions: {action_summary[:300]}\n\n"
+                "If there's something worth remembering (a contact detail, preference, "
+                "research finding, important fact, file reference, etc.), respond with "
+                "a JSON object: {\"store\": true, \"category\": \"...\", \"title\": \"...\", "
+                "\"content\": \"...\", \"tags\": [\"...\"]}\n"
+                "If nothing is worth storing, respond with: {\"store\": false}\n"
+                "Be selective — only store genuinely useful long-term information."
+            )
+
+            # Use Flash for speed (lightweight model)
+            provider = self.router.get("flash")
+            if not provider:
+                return
+
+            result = await provider.chat(
+                system_prompt="You are a concise memory curator. Respond ONLY with valid JSON.",
+                messages=[{"role": "user", "parts": [{"text": curator_prompt}]}],
+                temperature=0.1,
+            )
+
+            response_text = (result.get("text", "") or "").strip()
+            if not response_text:
+                return
+
+            # Parse the curator's decision
+            # Strip markdown code fences if present
+            if response_text.startswith("```"):
+                response_text = response_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+            decision = json.loads(response_text)
+            if not decision.get("store"):
+                return
+
+            # Store in vault
+            category = decision.get("category", "notes")
+            title = decision.get("title", "")
+            content = decision.get("content", "")
+            tags = decision.get("tags", [])
+
+            if title and content:
+                self.vault.store(
+                    category=category,
+                    title=title,
+                    content=content,
+                    tags=tags if isinstance(tags, list) else [],
+                    source=f"auto-curated from conversation",
+                )
+                print(f"[AgentV2] 🧠 Curator stored: [{category}] {title[:60]}")
+
+        except json.JSONDecodeError:
+            pass  # Curator response wasn't valid JSON — skip silently
+        except Exception as e:
+            print(f"[AgentV2] ⚠ Curator error (non-fatal): {e}")
 
     async def _build_world_state(
         self,
@@ -1240,51 +1189,8 @@ class MoonwalkAgentV2:
     #  Adaptive Plan Execution (LLM-in-the-loop)
     # ═══════════════════════════════════════════════════════════════
 
-    async def _perceive_environment(
-        self,
-        followup_inputs: Optional[list[str]] = None,
-        force_fresh: bool = False,
-    ) -> dict:
-        """Quick perception of the current desktop/browser state for step reasoning.
-
-        Results are cached for up to 500 ms when no UI-mutating tool has run
-        since the last call.  This avoids redundant osascript round-trips on
-        read-heavy / research milestones where the desktop state is stable.
-        Pass force_fresh=True (or call invalidate_perception_cache()) to bypass.
-        """
-        now = _time.time()
-
-        # ── Cache hit: return a shallow copy without re-running osascript ──
-        if (
-            not force_fresh
-            and self._perception_cache_valid
-            and self._perception_cache is not None
-            and (now - self._perception_cache[0]) < 0.5
-        ):
-            base = dict(self._perception_cache[1])
-            # Always overlay dynamic working-memory fields (they change fast)
-            last_typed_text = self.working_memory.get_last_typed_text()
-            if last_typed_text:
-                base["last_typed_text"] = last_typed_text[:500]
-            search_leads = self.working_memory.get_search_leads()
-            if search_leads:
-                base["search_lead_count"] = len(search_leads)
-                top_leads = []
-                for lead in search_leads[-3:]:
-                    title = str(lead.get("title", "")).strip()
-                    domain = str(lead.get("domain", "")).strip()
-                    status = "opened" if lead.get("opened") else "unopened"
-                    row = " | ".join(part for part in (title, domain, status) if part)
-                    if row:
-                        top_leads.append(row[:180])
-                if top_leads:
-                    base["search_leads"] = " || ".join(top_leads)
-            if followup_inputs:
-                base["user_followups"] = " || ".join(text[:200] for text in followup_inputs if text)
-            print("[AgentV2] ⚡ Perception cache hit")
-            return base
-
-        # ── Cache miss: run osascript layers in parallel ──
+    async def _perceive_environment(self, followup_inputs: Optional[list[str]] = None) -> dict:
+        """Quick perception of the current desktop/browser state for step reasoning."""
         env: dict = {}
         try:
             active_app, window_title, clipboard = await asyncio.gather(
@@ -1306,11 +1212,6 @@ class MoonwalkAgentV2:
                     env["selected_text"] = selected_text[:500]
         except Exception as e:
             print(f"[AgentV2] ⚠ Perception failed: {e}")
-
-        # ── Store in cache ──
-        self._perception_cache = (_time.time(), dict(env))
-        self._perception_cache_valid = True
-
         if followup_inputs:
             env["user_followups"] = " || ".join(text[:200] for text in followup_inputs if text)
         last_typed_text = self.working_memory.get_last_typed_text()
@@ -1330,10 +1231,6 @@ class MoonwalkAgentV2:
             if top_leads:
                 env["search_leads"] = " || ".join(top_leads)
         return env
-
-    def _invalidate_perception_cache(self) -> None:
-        """Invalidate the perception cache after a UI-mutating tool call."""
-        self._perception_cache_valid = False
 
     # ═══════════════════════════════════════════════════════════════
     #  Milestone-Based Execution (LLM micro-loop per milestone)
@@ -1382,7 +1279,6 @@ class MoonwalkAgentV2:
         )
         last_await_payload: Optional[dict] = dict(pending_execution.await_payload) if pending_execution else None
         self._last_opened_url = pending_execution.last_opened_url if pending_execution else ""
-        self._last_modal_data: Optional[dict] = None
 
         print(f"\n[AgentV2] ═══ Milestone Plan: {plan.task_summary} ═══")
         print(f"[AgentV2]   Milestones: {len(plan.milestones)}")
@@ -1391,65 +1287,100 @@ class MoonwalkAgentV2:
             print(f"[AgentV2]   [{m.id}] {m.goal} — signal: {m.success_signal}{deps}")
         print(f"[AgentV2] ═══{'═' * 50}═══\n")
 
+        # Reset Glance perception for this new task
+        from agent.glance import get_glance as _get_glance
+        _get_glance().reset()
+
         is_research = self._looks_like_research_doc_task(user_text, plan.task_summary or "")
 
-        # Reset perception cache at the start of each execution run so we always
-        # get a fresh read on the first turn of a new request.
-        self._invalidate_perception_cache()
+        # Tracks whether a send_response was already forwarded to ws_callback
+        # inside the milestone executor.  Suppresses the duplicate plain-text
+        # fallback response that _execute_milestone_plan would otherwise send.
+        response_emitted_to_ui = False
+
+        # Track whether the last tool was UI-mutating (drives passive visual injection)
+        last_tool_was_ui_mutating = False
+
+        async def milestone_visual_context() -> str:
+            """Gather DOM snapshot + screenshot description for passive injection."""
+            parts: list[str] = []
+            try:
+                from browser.store import browser_store
+                snap = browser_store.get_snapshot()
+                if snap and snap.elements:
+                    dom_lines = [f"Page: {snap.title} ({snap.url})"]
+                    for el in snap.elements[:30]:
+                        label = el.primary_label()[:60] if el.primary_label() else el.tag
+                        dom_lines.append(f"  [{el.ref_id}] {el.role or el.tag}: {label}")
+                    parts.append("\n".join(dom_lines))
+            except Exception as e:
+                print(f"[AgentV2] ⚠ DOM snapshot for visual context failed: {e}")
+
+            try:
+                screenshot_path = await perception.capture_screenshot()
+                if screenshot_path:
+                    parts.append(f"Screenshot captured: {screenshot_path}")
+            except Exception as e:
+                print(f"[AgentV2] ⚠ Screenshot for visual context failed: {e}")
+
+            return "\n".join(parts) if parts else ""
 
         async def milestone_env_perceiver() -> dict:
-            # The perception cache handles deduplication internally.
-            # When a UI-mutating tool ran, _invalidate_perception_cache() is
-            # called by tool_executor so the next call here goes to osascript.
-            return await self._perceive_environment(followup_inputs=followup_inputs)
+            env = await self._perceive_environment(followup_inputs=followup_inputs)
+            # Passive visual injection: only after UI-mutating tools
+            if last_tool_was_ui_mutating:
+                try:
+                    visual = await milestone_visual_context()
+                    if visual:
+                        env["visual_state"] = visual[:1500]
+                except Exception as e:
+                    print(f"[AgentV2] ⚠ Passive visual injection failed: {e}")
+            return env
 
         # Build tool-executor closure that reuses the existing step infrastructure
         async def tool_executor(tool: str, args: dict) -> tuple[str, bool]:
             nonlocal milestone_step_result_idx
             nonlocal last_await_payload
+            nonlocal last_tool_was_ui_mutating
+            nonlocal response_emitted_to_ui
 
-            # Research synthesis for writing tools
+            # Research synthesis for writing tools + send_response
             _WRITING_FIELDS = {
                 "gdocs_create": "body",
                 "gdocs_append": "text",
                 "write_file": "content",
+                "send_response": "message",   # inject research into the reply
             }
             target_field = _WRITING_FIELDS.get(tool)
-            if target_field and is_research:
-                snippets = self._collect_research_snippets(milestone_step_results)
-                if snippets:
-                    try:
-                        synthesized = await self._synthesize_research_body(
-                            provider=provider,
-                            user_text=user_text,
-                            task_summary=plan.task_summary or "",
-                            snippets=snippets,
-                        )
-                        if synthesized:
-                            # For research tasks, writing tools should use synthesized
-                            # content from collected snippets instead of LLM filler text.
-                            args[target_field] = synthesized
-                            print(f"[AgentV2] 📝 Synthesized research for {tool} ({len(synthesized)} chars)")
-                    except Exception as e:
-                        print(f"[AgentV2] ⚠ Research synthesis failed: {e}")
-            elif (
-                tool == "gdocs_create"
-                and target_field
-                and not args.get(target_field)
-                and self._looks_like_contentful_doc_task(user_text, plan.task_summary or "")
-            ):
-                try:
-                    synthesized = await self._synthesize_document_body(
-                        provider=provider,
-                        title=str(args.get("title", "") or ""),
-                        user_text=user_text,
-                        task_summary=plan.task_summary or "",
-                    )
-                    if synthesized:
-                        args[target_field] = synthesized
-                        print(f"[AgentV2] 📝 Synthesized document body for {tool} ({len(synthesized)} chars)")
-                except Exception as e:
-                    print(f"[AgentV2] ⚠ Document synthesis failed: {e}")
+            if target_field:
+                # For send_response: synthesise whenever working_memory has snippets
+                # (not gated on is_research so verbal research replies also get content)
+                wm_snippets_available = bool(self.working_memory.get_research_snippets())
+                should_synthesize = (
+                    is_research
+                    if tool != "send_response"
+                    else wm_snippets_available
+                )
+                if should_synthesize:
+                    snippets = self._collect_research_snippets(milestone_step_results)
+                    if snippets:
+                        try:
+                            synthesized = await self._synthesize_research_body(
+                                provider=provider,
+                                user_text=user_text,
+                                task_summary=plan.task_summary or "",
+                                snippets=snippets,
+                                for_response=(tool == "send_response"),
+                            )
+                            if synthesized:
+                                args[target_field] = synthesized
+                                if tool == "send_response":
+                                    # Upgrade to rich modal so markdown renders properly
+                                    args.setdefault("modal", "rich")
+                                    args.setdefault("title", "Research Results")
+                                print(f"[AgentV2] 📝 Synthesized research for {tool} ({len(synthesized)} chars)")
+                        except Exception as e:
+                            print(f"[AgentV2] ⚠ Research synthesis failed: {e}")
 
             temp_step = ExecutionStep(
                 id=0, tool=tool, args=dict(args),
@@ -1461,9 +1392,6 @@ class MoonwalkAgentV2:
                 task_summary=plan.task_summary or "",
             )
             result = str(temp_step.result or "") if success else str(temp_step.error or "")
-
-            if success and tool == "send_response" and temp_step.modal_data:
-                self._last_modal_data = temp_step.modal_data
 
             if success and tool == "await_reply":
                 last_await_payload = dict(temp_step.modal_data or {})
@@ -1483,15 +1411,29 @@ class MoonwalkAgentV2:
                         payload["payload"]["modal_data"] = temp_step.modal_data
                     await ws_callback(payload)
 
+            if success and tool == "send_response":
+                # Forward the rich modal payload immediately so the UI renders
+                # the correct modal type (rich, list, cards, etc.) rather than
+                # waiting for the outer plain-text fallback send.
+                modal_data = temp_step.modal_data or {}
+                if ws_callback:
+                    forward_payload: dict = {
+                        **modal_data,
+                        "display": "card",
+                        "app": context.active_app.lower() if context.active_app else "",
+                    }
+                    await ws_callback({"type": "response", "payload": forward_payload})
+                # Record so the outer _execute_milestone_plan fallback is skipped
+                response_emitted_to_ui = True
+                plan.final_response = modal_data.get("message", result) or result
+
             if success and tool != "await_reply":
                 milestone_step_result_idx += 1
                 milestone_step_results[milestone_step_result_idx] = result
 
-            # Invalidate perception cache after any UI-mutating action so the
-            # next env_perceiver call gets a fresh osascript read.
-            from agent.verifier import _UI_MUTATING_TOOLS
-            if tool in _UI_MUTATING_TOOLS:
-                self._invalidate_perception_cache()
+            # Track UI-mutating tools for passive visual injection
+            from agent.constants import UI_MUTATING_TOOLS as _UI_MUTATING_TOOLS
+            last_tool_was_ui_mutating = tool in _UI_MUTATING_TOOLS
 
             return (result, success)
 
@@ -1652,21 +1594,16 @@ class MoonwalkAgentV2:
         except Exception as e:
             print(f"[AgentV2] send_response error: {e}")
 
-        if ws_callback and final_response:
+        if ws_callback and final_response and not response_emitted_to_ui:
             display_text = final_response.replace("[CONVERSATION_MODE_ON]", "").replace("[CONVERSATION_MODE_OFF]", "")
             display = "pill" if len(display_text) <= 40 else "card"
-            payload = {
-                "text": display_text,
-                "display": display,
-                "app": context.active_app.lower() if context.active_app else "",
-            }
-            if getattr(self, "_last_modal_data", None):
-                payload["modal_data"] = self._last_modal_data
-                if "message" not in payload["modal_data"]:
-                    payload["modal_data"]["message"] = display_text
             await ws_callback({
                 "type": "response",
-                "payload": payload,
+                "payload": {
+                    "text": display_text,
+                    "display": display,
+                    "app": context.active_app.lower() if context.active_app else "",
+                },
             })
 
         self.conversation.add_model(final_response)
@@ -1681,16 +1618,12 @@ class MoonwalkAgentV2:
         return (final_response, False)
 
     def _looks_like_research_doc_task(self, user_text: str, task_summary: str) -> bool:
-        text = f"{user_text or ''} {task_summary or ''}".lower()
-        research_terms = ("research", "investigate", "analyze", "analyse", "compare", "study", "find", "look up", "best")
-        doc_terms = ("document", "report", "write up", "write-up", "brief", "summary", "paper", "article")
-        return any(term in text for term in research_terms) and any(term in text for term in doc_terms)
-
-    def _looks_like_contentful_doc_task(self, user_text: str, task_summary: str) -> bool:
-        text = f"{user_text or ''} {task_summary or ''}".lower()
-        doc_terms = ("document", "report", "google doc", "google document", "article", "brief", "paper")
-        content_terms = ("about", "regarding", "on ", "filled", "populate", "content", "write", "topic", "random")
-        return any(term in text for term in doc_terms) and any(term in text for term in content_terms)
+        """Delegate to the planner's canonical implementation."""
+        if self.planner:
+            return self.planner._is_research_document_request(user_text, task_summary)
+        # Fallback: inline heuristic when planner not yet initialized
+        lower = (user_text or "").lower()
+        return any(k in lower for k in ("write a document", "create a document", "write a report", "make a doc"))
 
     def _build_research_stream_lines(self, content_text: str, max_lines: int = 3) -> list[str]:
         lines: list[str] = []
@@ -1829,15 +1762,14 @@ class MoonwalkAgentV2:
                     reason = "search_page" if _is_search_page else "browser_chrome"
                     print(f"[ResearchStream] stored=false reason={reason}")
                 else:
-                    before_count = len(self.working_memory.get_research_snippets())
-                    self.working_memory.log_research_snippet(
+                    was_stored = self.working_memory.log_research_snippet(
                         source=source_url,
                         title=source_title,
                         content=content_text,
                         tool=step.tool,
                     )
                     snippet_count = len(self.working_memory.get_research_snippets())
-                    if snippet_count > before_count:
+                    if was_stored:
                         print(f"[AgentV2] 📚 Research stored: {snippet_count} snippet(s) total")
                         print(f"[ResearchStream] stored=true snippets={snippet_count}")
                     else:
@@ -1975,23 +1907,42 @@ class MoonwalkAgentV2:
         user_text: str,
         task_summary: str,
         snippets: list[str],
+        for_response: bool = False,
     ) -> str:
         snippet_text = "\n\n".join(
             f"[Snippet {idx + 1}]\n{snippet}" for idx, snippet in enumerate(snippets)
         )
-        prompt = (
-            "Write a complete, factual document from the research snippets.\n"
-            f"Task: {user_text or task_summary}\n\n"
-            "Requirements:\n"
-            "- Use clear section headings.\n"
-            "- Cover major system categories, how they work, and key tradeoffs.\n"
-            "- Keep claims grounded in the snippets.\n"
-            "- Return only the document text (markdown allowed).\n\n"
-            f"{snippet_text}"
-        )
+        if for_response:
+            # Conversational summary — returned directly to the user via send_response
+            prompt = (
+                f"The user asked: {user_text or task_summary}\n\n"
+                "Using ONLY the research snippets below, write a clear and engaging summary "
+                "to present to the user. Cover: what it is, key facts, background context, "
+                "and anything interesting or directly relevant to the user's question. "
+                "Use **bold** section labels but keep the tone conversational. "
+                "Return only the summary — no preamble, no meta-commentary.\n\n"
+                f"{snippet_text}"
+            )
+            system_prompt = (
+                "You are a knowledgeable research assistant. "
+                "Present findings clearly, concisely, and engagingly."
+            )
+        else:
+            # Full document — written to a file or Google Doc
+            prompt = (
+                "Write a complete, factual document from the research snippets.\n"
+                f"Task: {user_text or task_summary}\n\n"
+                "Requirements:\n"
+                "- Use clear section headings.\n"
+                "- Cover major system categories, how they work, and key tradeoffs.\n"
+                "- Keep claims grounded in the snippets.\n"
+                "- Return only the document text (markdown allowed).\n\n"
+                f"{snippet_text}"
+            )
+            system_prompt = "You are an expert research analyst. Produce concise, accurate prose."
         response = await provider.generate(
             messages=[{"role": "user", "parts": [{"text": prompt}]}],
-            system_prompt="You are an expert policy and housing analyst. Produce concise, accurate prose.",
+            system_prompt=system_prompt,
             tools=[],
             temperature=0.2,
         )
@@ -1999,36 +1950,6 @@ class MoonwalkAgentV2:
         if text.startswith("```"):
             text = text.strip("`")
         return text[:14000]
-
-    async def _synthesize_document_body(
-        self,
-        provider: LLMProvider,
-        *,
-        title: str,
-        user_text: str,
-        task_summary: str,
-    ) -> str:
-        topic = str(title or task_summary or user_text or "Interesting Topic").strip()
-        prompt = (
-            "Write a concise but complete document for a new Google Doc.\n"
-            f"Request: {user_text or task_summary}\n"
-            f"Document title/topic: {topic}\n\n"
-            "Requirements:\n"
-            "- Use markdown headings.\n"
-            "- Include a short introduction, 3-4 informative sections, and a brief conclusion.\n"
-            "- Be factual when possible and reasonable when the prompt is open-ended.\n"
-            "- Return only the document text.\n"
-        )
-        response = await provider.generate(
-            messages=[{"role": "user", "parts": [{"text": prompt}]}],
-            system_prompt="You write clear, useful document drafts for end users.",
-            tools=[],
-            temperature=0.6,
-        )
-        text = (response.text or "").strip() if response else ""
-        if text.startswith("```"):
-            text = text.strip("`")
-        return text[:12000]
 
     def _remember_opened_url(self, step: ExecutionStep, result: str) -> None:
         if step.tool == "open_url":
@@ -2127,40 +2048,6 @@ class MoonwalkAgentV2:
 
         return retry_result
 
-    async def _wait_for_snapshot_change(self, timeout: float = 1.5) -> None:
-        """Poll until the browser snapshot changes (URL or version) or timeout expires.
-
-        Replaces the hard asyncio.sleep(BROWSER_NAV_SETTLE_S) after navigation
-        actions. On fast page loads the loop exits after 200-500ms; on slow
-        loads it caps at ``timeout`` seconds, matching the old behaviour exactly.
-        Falls back to a plain sleep when the browser bridge is not connected.
-        """
-        try:
-            from browser.store import browser_store
-        except Exception:
-            # No browser extension — plain sleep as safeguard
-            await asyncio.sleep(timeout)
-            return
-
-        snap_before = browser_store.get_snapshot()
-        url_before = getattr(snap_before, "url", None) or ""
-        ver_before = id(snap_before)  # identity changes when store updates
-
-        deadline = _time.monotonic() + timeout
-        poll_interval = 0.1  # 100 ms
-
-        while _time.monotonic() < deadline:
-            await asyncio.sleep(poll_interval)
-            snap_now = browser_store.get_snapshot()
-            url_now = getattr(snap_now, "url", None) or ""
-            if snap_now is not None and (id(snap_now) != ver_before or url_now != url_before):
-                waited = timeout - (deadline - _time.monotonic())
-                print(f"[AgentV2] ⚡ Smart settle resolved in ~{waited:.2f}s (target {timeout}s)")
-                return
-
-        # Timeout reached — page didn't push a new snapshot; continue anyway
-        print(f"[AgentV2] ⏱ Smart settle timed out after {timeout}s")
-
     async def _execute_step(
         self,
         step: ExecutionStep,
@@ -2197,15 +2084,17 @@ class MoonwalkAgentV2:
                 "get_page_summary",
             }
             # Before browser reads: verify snapshot matches real browser URL
+            # Only check if the snapshot is stale (>3s) — post-nav refresh already covers fresh cases
             if step.tool in browser_read_tools and not step.args.get("refresh"):
                 try:
-                    _rd_app = await perception.get_active_app()
-                    if _rd_app.lower() in perception.BROWSERS:
-                        _rd_url = await perception.get_browser_url(_rd_app)
-                        if _rd_url:
-                            from browser.store import browser_store as _bstore
-                            _snap = _bstore.get_snapshot()
-                            if _snap and self._domain_key(_rd_url) != self._domain_key(_snap.url or ""):
+                    from browser.store import browser_store as _bstore
+                    _snap = _bstore.get_snapshot()
+                    _snap_age = (_time.time() - float(_snap.timestamp or 0)) if _snap else 999
+                    if _snap_age > 3.0:
+                        _rd_app = await perception.get_active_app()
+                        if _rd_app.lower() in perception.BROWSERS:
+                            _rd_url = await perception.get_browser_url(_rd_app)
+                            if _rd_url and _snap and self._domain_key(_rd_url) != self._domain_key(_snap.url or ""):
                                 if step.tool in ("browser_read_page", "browser_read_text"):
                                     step.args["refresh"] = True
                                 else:
@@ -2226,11 +2115,16 @@ class MoonwalkAgentV2:
             # snapshot refresh so the next browser_read_page reads the search
             # results instead of whatever tab was previously active.
             if step.tool == "web_search":
-                await self._wait_for_snapshot_change(timeout=BROWSER_NAV_SETTLE_S)
+                # Wait for a new snapshot instead of a fixed sleep
+                from browser.bridge import browser_bridge as _bb
+                from browser.store import browser_store as _bstore
+                _pre_snap = _bstore.get_snapshot()
+                _pre_gen = _pre_snap.generation if _pre_snap else 0
                 try:
                     await tool_registry.execute("browser_refresh_refs", {})
                 except Exception:
                     pass  # Non-critical
+                await _bb.wait_for_snapshot(min_generation=_pre_gen, timeout=2.0)
 
             # After click navigation: wait for page to load and refresh snapshot
             # so the next read step sees the new page, not stale pre-click data.
@@ -2238,11 +2132,16 @@ class MoonwalkAgentV2:
             if step.tool == "find_and_act" and str(step.args.get("action", "")).lower() == "click":
                 should_refresh_after_nav = True
             if should_refresh_after_nav:
-                await self._wait_for_snapshot_change(timeout=BROWSER_NAV_SETTLE_S)
+                # Event-driven: wait for a snapshot newer than pre-action, with short fallback
+                from browser.bridge import browser_bridge as _bb2
+                from browser.store import browser_store as _bstore2
+                _nav_pre_snap = _bstore2.get_snapshot()
+                _nav_pre_gen = _nav_pre_snap.generation if _nav_pre_snap else 0
                 try:
                     await tool_registry.execute("browser_refresh_refs", {})
                 except Exception:
                     pass
+                await _bb2.wait_for_snapshot(min_generation=_nav_pre_gen, timeout=2.0)
                 # Update tracked URL to the REAL browser URL after navigation.
                 # This prevents drift detection from trying to navigate BACK to
                 # the previous page (e.g. Google search results).
@@ -2363,57 +2262,35 @@ class MoonwalkAgentV2:
                 total_elapsed = _time.time() - t_start
                 print(f"[AgentV2] └─ ✓ Step {step.id} COMPLETED ({total_elapsed:.2f}s)")
                 return True
-
-            if should_attempt_vision_recovery(
-                tool_name=step.tool,
-                tool_args=step.args,
-                tool_result=result,
-                verification_message=verification.message,
-                verification_confidence=verification.confidence,
-                should_retry=verification.should_retry,
-            ):
-                print(f"[AgentV2] │  Attempting conservative vision recovery for {step.tool}…")
-
-                async def _vision_tool_executor(name: str, args: dict) -> str:
-                    return await tool_registry.execute(name, args)
-
-                recovery = await attempt_vision_recovery(
-                    tool_name=step.tool,
-                    tool_args=step.args,
-                    tool_executor=_vision_tool_executor,
-                )
-                if recovery.success and recovery.tool_name:
-                    recovery_verification = await self.verifier.verify_with_visual(
-                        tool_name=recovery.tool_name,
-                        tool_args=recovery.tool_args or {},
-                        tool_result=recovery.result,
-                        success_criteria=step.success_criteria,
-                        get_current_state=self._get_quick_state,
-                        get_visual_state=self._get_visual_state,
-                    )
-                    if recovery_verification.success:
-                        if step.tool not in ("send_response", "await_reply"):
-                            self.working_memory.log_action(
-                                tool=step.tool,
-                                args=step.args,
-                                result=recovery.result,
-                                success=True,
-                            )
-                        step.status = StepStatus.COMPLETED
-                        step.result = recovery.result
-                        print(f"[AgentV2] │  Vision recovery succeeded: {recovery.reason}")
-                        total_elapsed = _time.time() - t_start
-                        print(f"[AgentV2] └─ ✓ Step {step.id} COMPLETED ({total_elapsed:.2f}s)")
-                        return True
-                    print(f"[AgentV2] │  Vision recovery did not verify: {recovery_verification.message}")
-                elif recovery.attempted:
-                    print(f"[AgentV2] │  Vision recovery could not localize a safe target.")
             
             # Verification failed - try retry or fallback
             if verification.should_retry and step.retries < step.max_retries:
                 print(f"[AgentV2] │  ↻ Retrying step {step.id} (attempt {step.retries + 1}/{step.max_retries})…")
                 step.retries += 1
                 step.status = StepStatus.PENDING  # Reset for retry
+
+                # Adaptive retry: modify args for known failure patterns
+                if step.tool == "type_in_field" and "no text field matching" in str(verification.message).lower():
+                    # Try alternative field descriptions on retry
+                    original_desc = step.args.get("field_description", "")
+                    alt_descs = {
+                        "Search": "Search or filter",
+                        "search": "Search or filter",
+                        "Search or filter": "text field",
+                        "Message": "Type a message",
+                        "message": "Type a message",
+                    }
+                    new_desc = alt_descs.get(original_desc)
+                    if new_desc:
+                        step.args["field_description"] = new_desc
+                        print(f"[AgentV2] │  Adapted retry: field_description='{new_desc}'")
+
+                if step.tool == "get_ui_tree" and "timed out" in str(verification.message).lower():
+                    # On timeout retry, add a brief delay for app to settle
+                    import asyncio as _asyncio
+                    await _asyncio.sleep(1.0)
+                    print(f"[AgentV2] │  Adapted retry: added 1s settle delay after timeout")
+
                 return await self._execute_step(step, world_state, ws_callback, user_text=user_text, task_summary=task_summary)
             
             # Try fallback tool if available

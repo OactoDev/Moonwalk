@@ -326,6 +326,21 @@ async def _gdocs_state_via_bridge() -> dict:
         return {}
 
 
+async def _wait_for_kix_rendered(timeout: float = 5.0) -> bool:
+    """Poll gdocs_state until the kix editor canvas has initialised (editor_ready=True).
+    On fresh documents kix renders asynchronously — reading the body before it is
+    ready returns an empty string even though the doc is open."""
+    started = time.time()
+    while time.time() - started < timeout:
+        state = await _gdocs_state_via_bridge()
+        if state.get("editor_ready"):
+            await asyncio.sleep(0.3)  # brief settle after canvas init
+            return True
+        await asyncio.sleep(0.25)
+    print("[_wait_for_kix_rendered] ⚠ Timed out waiting for kix editor to render")
+    return False
+
+
 async def _gdocs_set_title(title: str) -> bool:
     if not title:
         return True
@@ -362,6 +377,10 @@ def _extract_doc_id_from_url(url: str) -> str:
 
 
 async def _gdocs_read_body() -> str:
+    # Wait for kix canvas to render before querying DOM selectors — on freshly
+    # opened docs the kix editor initialises asynchronously and returns empty
+    # text until editor_ready is True.
+    await _wait_for_kix_rendered(timeout=5.0)
     raw = await _bridge_extract("gdocs_read_body", timeout=4.0)
     if raw and len(_normalize_doc_text(raw)) >= 12:
         return raw
@@ -395,7 +414,7 @@ async def _gdocs_replace_body(body: str) -> bool:
     await _osascript('tell application "System Events" to keystroke "a" using command down')
     await asyncio.sleep(0.15)
     await _paste_html(body)
-    await asyncio.sleep(0.8)
+    await asyncio.sleep(2.5)
     readback = await _gdocs_read_body()
     if _body_matches_expected(readback, body):
         return True
@@ -405,7 +424,7 @@ async def _gdocs_replace_body(body: str) -> bool:
         await _osascript('tell application "System Events" to keystroke "a" using command down')
         await asyncio.sleep(0.15)
         await _paste_html(body)
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(2.5)
         readback = await _gdocs_read_body()
         if _body_matches_expected(readback, body):
             return True
@@ -430,7 +449,7 @@ async def _gdocs_append_body(text: str) -> bool:
     await _osascript('tell application "System Events" to key code 119 using command down')
     await asyncio.sleep(0.25)
     await _paste_html("\n" + text)
-    await asyncio.sleep(0.8)
+    await asyncio.sleep(2.5)
     readback = await _gdocs_read_body()
     if _body_matches_expected(readback, text):
         return True
@@ -440,7 +459,7 @@ async def _gdocs_append_body(text: str) -> bool:
         await _osascript('tell application "System Events" to key code 119 using command down')
         await asyncio.sleep(0.25)
         await _paste_html("\n" + text)
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(2.5)
         readback = await _gdocs_read_body()
         if _body_matches_expected(readback, text):
             return True

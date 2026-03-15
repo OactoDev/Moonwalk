@@ -4,6 +4,7 @@ Moonwalk — Browser Bridge State
 Tracks extension connection state and queued browser actions.
 """
 
+import asyncio
 import os
 import secrets
 import time
@@ -14,21 +15,40 @@ from runtime_state import runtime_state_store
 
 
 class BrowserBridge:
+    # If no heartbeat/snapshot is received within this window (seconds),
+    # consider the extension disconnected even though it never sent a
+    # disconnect event.
+    STALE_THRESHOLD: float = 60.0
+
     def __init__(self):
-        self._session_token = os.environ.get("MOONWALK_BROWSER_BRIDGE_TOKEN", "").strip() or "dev-bridge-token"
+        configured = os.environ.get("MOONWALK_BROWSER_BRIDGE_TOKEN", "").strip()
+        self._session_token = configured or "dev-bridge-token"
         self._connected_session_id: Optional[str] = None
         self._last_seen_at: float = 0.0
         self._pending_actions: List[ActionRequest] = []
         self._extension_name: str = ""
         self._latest_result_by_action_id: Dict[str, ActionResult] = {}
         self._latest_dom_change_by_action_id: Dict[str, DomChangeEvent] = {}
+        # Event-driven signaling — callers await these instead of polling
+        self._result_events: Dict[str, asyncio.Event] = {}
+        self._snapshot_event: asyncio.Event = asyncio.Event()
+        self._snapshot_generation: int = 0
+        self._extension_ws = None  # WebSocket to the extension for push
 
     @property
     def session_token(self) -> str:
         return self._session_token
 
     def is_connected(self) -> bool:
-        return bool(self._connected_session_id)
+        """True only if a session is registered AND we've heard from the
+        extension within the staleness window."""
+        if not self._connected_session_id:
+            return False
+        if self._last_seen_at and (time.time() - self._last_seen_at > self.STALE_THRESHOLD):
+            # Auto-disconnect stale session
+            self.disconnect()
+            return False
+        return True
 
     def connected_session_id(self) -> Optional[str]:
         return self._connected_session_id
@@ -48,6 +68,13 @@ class BrowserBridge:
         self._last_seen_at = time.time()
         runtime_state_store.mark_browser_connected(session_id=session_id)
 
+    def set_extension_ws(self, ws) -> None:
+        """Store the extension WebSocket for server-push."""
+        self._extension_ws = ws
+
+    def clear_extension_ws(self) -> None:
+        self._extension_ws = None
+
     def touch(self) -> None:
         self._last_seen_at = time.time()
 
@@ -56,6 +83,10 @@ class BrowserBridge:
         self._connected_session_id = snapshot.session_id
         self._last_seen_at = time.time()
         runtime_state_store.register_browser_snapshot(snapshot)
+        # Signal any coroutines waiting for a new snapshot
+        self._snapshot_generation = getattr(snapshot, "generation", 0)
+        self._snapshot_event.set()
+        self._snapshot_event = asyncio.Event()  # Reset for next waiter
 
     def queue_action(self, request: ActionRequest) -> ActionResult:
         if not self.is_connected():
@@ -74,7 +105,9 @@ class BrowserBridge:
             if request.action in _snapshotless_actions and (request.session_id or self._connected_session_id):
                 request.session_id = request.session_id or self._connected_session_id or ""
                 request.action_id = request.action_id or f"act_{int(time.time() * 1000)}_{secrets.token_hex(4)}"
+                self._result_events[request.action_id] = asyncio.Event()
                 self._pending_actions.append(request)
+                self._try_push_actions(request.session_id)
                 return ActionResult(
                     ok=True,
                     message=f"{request.action} queued (no snapshot yet).",
@@ -94,6 +127,7 @@ class BrowserBridge:
 
         request.session_id = request.session_id or snapshot.session_id
         request.action_id = request.action_id or f"act_{int(time.time() * 1000)}_{secrets.token_hex(4)}"
+        self._result_events[request.action_id] = asyncio.Event()
         if request.action in {"evaluate_js", "extract_data", "extract_readability"}:
             request.metadata = {
                 **request.metadata,
@@ -126,6 +160,7 @@ class BrowserBridge:
                     "href": element.href,
                 }
         self._pending_actions.append(request)
+        self._try_push_actions(request.session_id)
         return ActionResult(
             ok=True,
             message="Action queued for browser extension execution.",
@@ -151,9 +186,38 @@ class BrowserBridge:
             return 0
         return sum(1 for action in self._pending_actions if action.session_id == sid)
 
+    def _try_push_actions(self, session_id: str) -> None:
+        """Push pending actions to the extension WebSocket immediately."""
+        import json as _json
+        ws = self._extension_ws
+        if ws is None:
+            return
+        actions = [a for a in self._pending_actions if a.session_id == session_id]
+        if not actions:
+            return
+        try:
+            payload = _json.dumps({
+                "type": "browser_actions",
+                "ok": True,
+                "session_id": session_id,
+                "actions": [a.__dict__ for a in actions],
+            })
+            # Drain these actions so they're not sent again on poll
+            self._pending_actions = [a for a in self._pending_actions if a.session_id != session_id]
+            # Fire-and-forget: schedule the send on the event loop
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(ws.send(payload))
+        except Exception:
+            pass  # Fall back to polling
+
     def record_action_result(self, result: ActionResult) -> None:
         if result.action_id:
             self._latest_result_by_action_id[result.action_id] = result
+            # Signal any coroutine waiting on this action
+            evt = self._result_events.pop(result.action_id, None)
+            if evt:
+                evt.set()
         self._last_seen_at = time.time()
         runtime_state_store.record_browser_action_result(result)
         details = result.details or {}
@@ -170,6 +234,46 @@ class BrowserBridge:
 
     def latest_action_result(self, action_id: str) -> Optional[ActionResult]:
         return self._latest_result_by_action_id.get(action_id)
+
+    async def wait_for_result(self, action_id: str, timeout: float = 10.0) -> Optional[ActionResult]:
+        """Await the action result instead of polling.  Returns None on timeout."""
+        # Already recorded?
+        existing = self._latest_result_by_action_id.get(action_id)
+        if existing:
+            self._result_events.pop(action_id, None)
+            return existing
+        evt = self._result_events.get(action_id)
+        if not evt:
+            return None
+        try:
+            await asyncio.wait_for(evt.wait(), timeout=max(0.05, timeout))
+        except asyncio.TimeoutError:
+            self._result_events.pop(action_id, None)
+            return self._latest_result_by_action_id.get(action_id)
+        self._result_events.pop(action_id, None)
+        return self._latest_result_by_action_id.get(action_id)
+
+    async def wait_for_snapshot(self, session_id: str = "", min_generation: int = 0, timeout: float = 2.0) -> Optional["PageSnapshot"]:
+        """Await the next snapshot with generation > min_generation."""
+        sid = session_id or self._connected_session_id
+        # Check if we already have a satisfying snapshot
+        current = browser_store.get_snapshot(sid)
+        if current and current.generation > min_generation:
+            return current
+        deadline = time.time() + max(0.05, timeout)
+        while time.time() < deadline:
+            evt = self._snapshot_event
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait_for(evt.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+            current = browser_store.get_snapshot(sid)
+            if current and current.generation > min_generation:
+                return current
+        return browser_store.get_snapshot(sid)
 
     def record_dom_change(self, event: DomChangeEvent) -> None:
         if event.action_id:
@@ -190,6 +294,9 @@ class BrowserBridge:
         self._pending_actions.clear()
         self._latest_result_by_action_id.clear()
         self._latest_dom_change_by_action_id.clear()
+        self._result_events.clear()
+        self._snapshot_event = asyncio.Event()
+        self._snapshot_generation = 0
         self._extension_name = ""
         runtime_state_store.mark_browser_disconnected()
 

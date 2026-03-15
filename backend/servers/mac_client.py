@@ -173,6 +173,30 @@ class MacClient:
                     ping_timeout=600,
                     max_size=10 * 1024 * 1024,
                 ) as cloud_ws:
+                    # ── Auth handshake ──
+                    # Load credentials (user_id + auth_token) from .env or cred file
+                    auth_token = os.environ.get("MOONWALK_CLOUD_TOKEN", "")
+                    user_id = os.environ.get("MOONWALK_USER_ID", "local-user")
+                    await cloud_ws.send(json.dumps({
+                        "type": "auth",
+                        "method": "token",
+                        "token": auth_token,
+                        "user_id": user_id,
+                    }))
+                    # Wait for auth_result
+                    try:
+                        raw = await asyncio.wait_for(cloud_ws.recv(), timeout=15.0)
+                        result = json.loads(raw)
+                        if result.get("type") == "auth_result":
+                            if not result.get("ok"):
+                                print(f"[Mac] Auth rejected: {result.get('error')}")
+                                await asyncio.sleep(5)
+                                continue
+                            print(f"[Mac] ✓ Auth OK — user_id='{result.get('user_id')}'")
+                    except asyncio.TimeoutError:
+                        print("[Mac] Auth timeout from cloud server")
+                        continue
+
                     self.cloud_ws = cloud_ws
                     print(f"[Mac] ✓ Connected to Cloud Orchestrator!")
 
