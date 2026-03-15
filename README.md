@@ -1,4 +1,4 @@
-# 🌙 Moonwalk
+# Moonwalk
 
 **AI desktop assistant for macOS** — a transparent glass-pill overlay that uses voice and text to control your Mac.
 
@@ -10,7 +10,7 @@ Built with Electron + Python. Thinks with LLMs. Acts through Accessibility APIs 
   <img src="docs/screenshots/moonwalk.png" alt="Idle State" width="480"/>
 </p>
 
-## ✨ Features
+## Features
 
 - **Voice-first** — Press `⌘⇧Space`, speak naturally, watch it act
 - **Text commands** — Press `⌥Space` for a quick command panel
@@ -23,7 +23,7 @@ Built with Electron + Python. Thinks with LLMs. Acts through Accessibility APIs 
 
 ---
 
-## 🎨 UI States
+## UI States
 
 The glass pill morphs between four states:
 
@@ -58,7 +58,7 @@ The glass pill morphs between four states:
 
 ---
 
-## 🏗 Architecture
+## Architecture
 
 <p align="center">
   <img src="docs/screenshots/architecture.svg" alt="Moonwalk Architecture" width="800"/>
@@ -75,7 +75,7 @@ The glass pill morphs between four states:
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ```bash
 # 1. Clone & install
@@ -107,7 +107,7 @@ npm start
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 Moonwalk/
