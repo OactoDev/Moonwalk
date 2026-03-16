@@ -10,6 +10,9 @@ Built with Electron + Python. Thinks with LLMs. Acts through Accessibility APIs 
   <img src="docs/screenshots/Moonwalk.png" alt="Logo" width="480"/>
 </p>
 
+---
+Demo Video: [https://youtu.be/u3QoaT3pIMs]
+
 ## Features
 
 - **Voice-first** — Say "Hey Moonwalk" or Press `⌘⇧Space`, speak naturally, watch it act
