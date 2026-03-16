@@ -70,9 +70,6 @@ The glass pill morphs between four states:
   <img src="docs/screenshots/spav-loop.svg" alt="SPAV Agent Loop" width="600"/>
 </p>
 
-> 🎬 **[Open the interactive "How It Works" presentation →](docs/how-it-works.html)**
-> <br><sub>Cinematic walkthrough with animated glassmorphic flowcharts. Open in a browser — keyboard / click to navigate, or let it auto-play for screen recording.</sub>
-
 ---
 
 ## Quick Start
