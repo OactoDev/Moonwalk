@@ -12,10 +12,8 @@ Built with Electron + Python. Thinks with LLMs. Acts through Accessibility APIs 
 
 ## Features
 
-- **Voice-first** — Press `⌘⇧Space`, speak naturally, watch it act
-- **Text commands** — Press `⌥Space` for a quick command panel
+- **Voice-first** — Say "Hey Moonwalk" or Press `⌘⇧Space`, speak naturally, watch it act
 - **SPAV Agent** — Sense → Plan → Act → Verify loop with milestone-based execution
-- **Glass-pill UI** — Frosted translucent overlay, always-on-top, click-through
 - **Multi-modal responses** — Cards, tables, rich text, step timelines, image viewer
 - **Browser automation** — Chrome extension bridges web actions (search, fill forms, extract data)
 - **Cloud-ready** — Deploy brain to GCP Cloud Run with Firestore memory + GCS storage
