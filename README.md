@@ -89,7 +89,7 @@ pip install -r backend/requirements.txt
 
 # 3. Environment variables
 cp .env.example .env
-# Fill in: OPENAI_API_KEY, GOOGLE_API_KEY
+# Fill in: GOOGLE_API_KEY
 
 # 4. Launch
 npm start
