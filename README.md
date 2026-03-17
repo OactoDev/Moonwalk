@@ -174,7 +174,7 @@ gcloud run deploy moonwalk-brain \
   --allow-unauthenticated \
   --port 8080 \
   --cpu 2 --memory 2Gi \
-  --set-env-vars "OPENAI_API_KEY=<key>,AUTH_SHARED_SECRET=<secret>"
+  --set-env-vars "GEMINI_API_KEY=<key>,AUTH_SHARED_SECRET=<secret>"
 ```
 
 Health check: `GET /health` → `{"status":"ok","agents":0}`
