@@ -76,38 +76,7 @@ body {
 }
 
 /* ── Conversation Mode indicator ── */
-.glass-pill.conversation-mode {
-  border: 1.5px solid rgba(52, 199, 89, 0.5);
-  box-shadow:
-    0 12px 32px -8px rgba(0, 0, 0, 0.1),
-    inset 0 1px 1px rgba(255, 255, 255, 0.9),
-    inset 0 -1px 1px rgba(0, 0, 0, 0.05),
-    0 0 12px rgba(52, 199, 89, 0.15);
-}
 
-.glass-pill.conversation-mode.state-idle::after {
-  content: 'LIVE';
-  position: absolute;
-  right: 12px;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  color: #1f9d55;
-  opacity: 0.9;
-  animation: conv-pulse 2s ease-in-out infinite;
-}
-
-@keyframes conv-pulse {
-
-  0%,
-  100% {
-    opacity: 0.5;
-  }
-
-  50% {
-    opacity: 1;
-  }
-}
 
 /* ── State Sizing ── */
 .state-idle {
@@ -126,6 +95,68 @@ body {
 .state-doing {
   width: 320px;
 }
+
+/* ── Speaking Variant (TTS playback) ── */
+.glass-pill.variant-speaking {
+  border-color: rgba(52, 120, 246, 0.35);
+  box-shadow:
+    0 12px 32px -8px rgba(0, 0, 0, 0.1),
+    inset 0 1px 1px rgba(255, 255, 255, 0.9),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.05),
+    0 0 14px rgba(52, 120, 246, 0.12);
+  animation: speak-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes speak-pulse {
+  0%, 100% {
+    box-shadow:
+      0 12px 32px -8px rgba(0, 0, 0, 0.1),
+      inset 0 1px 1px rgba(255, 255, 255, 0.9),
+      inset 0 -1px 1px rgba(0, 0, 0, 0.05),
+      0 0 10px rgba(52, 120, 246, 0.10);
+  }
+  50% {
+    box-shadow:
+      0 12px 32px -8px rgba(0, 0, 0, 0.1),
+      inset 0 1px 1px rgba(255, 255, 255, 0.9),
+      inset 0 -1px 1px rgba(0, 0, 0, 0.05),
+      0 0 18px rgba(52, 120, 246, 0.20);
+  }
+}
+
+/* ── Stop Button (inside pill) ── */
+.pill-stop-btn {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(0, 0, 0, 0.06);
+  color: #48484a;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s, color 0.2s, opacity 0.3s;
+  z-index: 20;
+  padding: 0;
+  opacity: 1;
+}
+
+.pill-stop-btn:hover {
+  background: rgba(255, 59, 48, 0.12);
+  color: #ff3b30;
+}
+
+.pill-stop-btn.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+
 
 /* ── Typography ── */
 .status-text {
@@ -1805,9 +1836,14 @@ body {
 }
 
 
-/* ══════════════════════════════════════════
-   ONBOARDING MODAL — First-launch setup
-   ══════════════════════════════════════════ */
+/* ══════════════════════════════════════════════════════
+   ONBOARDING — Frosted-glass setup wizard
+   Matches the Glass Pill design language:
+   • frosted white glass (light theme)
+   • -apple-system font stack
+   • --accent (#007aff), --green, --muted colours
+   • rounded pill-like corners, soft shadows
+   ══════════════════════════════════════════════════════ */
 
 .onboarding-overlay {
   position: fixed;
@@ -1815,11 +1851,12 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.6);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  background: rgba(245, 245, 247, 0.55);
+  backdrop-filter: blur(40px) saturate(180%);
+  -webkit-backdrop-filter: blur(40px) saturate(180%);
   z-index: 9999;
-  animation: onboard-fade-in 0.4s ease;
+  pointer-events: auto;
+  animation: onboard-fade-in 0.5s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 .onboarding-overlay.hidden {
@@ -1827,71 +1864,85 @@ body {
 }
 
 @keyframes onboard-fade-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
+  from { opacity: 0; transform: scale(0.97); }
+  to   { opacity: 1; transform: scale(1); }
 }
 
+/* ── Card (frosted white glass, like the pill) ── */
 .onboarding-card {
-  width: 380px;
-  background: rgba(28, 28, 30, 0.95);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 18px;
-  padding: 32px 28px 24px;
-  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.5);
+  width: 400px;
+  max-width: 92vw;
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(30px) saturate(200%);
+  -webkit-backdrop-filter: blur(30px) saturate(200%);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 24px;
+  padding: 36px 32px 28px;
+  box-shadow:
+    0 24px 80px -12px rgba(0, 0, 0, 0.12),
+    inset 0 1px 1px rgba(255, 255, 255, 0.9),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.03);
   text-align: center;
+  pointer-events: auto;
 }
 
+/* ── Header ── */
 .onboarding-header {
-  margin-bottom: 20px;
+  margin-bottom: 24px;
 }
 
 .onboarding-logo {
-  margin-bottom: 12px;
+  margin-bottom: 14px;
+  filter: drop-shadow(0 2px 6px rgba(0, 122, 255, 0.18));
 }
 
 .onboarding-title {
-  font-size: 20px;
+  font-size: 22px;
   font-weight: 700;
-  color: #f5f5f7;
+  letter-spacing: -0.02em;
+  color: #1d1d1f;
   margin: 0;
 }
 
 .onboarding-subtitle {
   font-size: 13px;
-  color: #86868b;
-  margin: 4px 0 0;
+  color: #6e6e73;
+  margin: 6px 0 0;
+  letter-spacing: -0.01em;
 }
 
+/* ── Steps ── */
 .onboarding-step {
   display: none;
 }
 
 .onboarding-step.active {
   display: block;
-  animation: onboard-slide-in 0.3s ease;
+  animation: onboard-slide-in 0.35s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 @keyframes onboard-slide-in {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
 .onboarding-body {
   text-align: left;
-  margin-bottom: 20px;
+  margin-bottom: 22px;
 }
 
 .onboarding-body p {
   font-size: 13px;
-  color: #c8c8cc;
-  line-height: 1.5;
+  color: #48484a;
+  line-height: 1.55;
   margin-bottom: 16px;
 }
 
+/* ── Checklist (Step 2) ── */
 .onboarding-checklist {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
 }
 
 .check-item {
@@ -1899,10 +1950,13 @@ body {
   align-items: center;
   gap: 10px;
   font-size: 13px;
-  color: #e5e5ea;
-  padding: 8px 12px;
-  background: rgba(255, 255, 255, 0.05);
-  border-radius: 10px;
+  font-weight: 500;
+  color: #1d1d1f;
+  padding: 10px 14px;
+  background: rgba(0, 0, 0, 0.03);
+  border: 1px solid rgba(0, 0, 0, 0.04);
+  border-radius: 12px;
+  transition: background 0.2s, border-color 0.2s;
 }
 
 .check-item .check-icon {
@@ -1911,9 +1965,19 @@ body {
   text-align: center;
 }
 
+.check-item.ok {
+  background: rgba(52, 199, 89, 0.06);
+  border-color: rgba(52, 199, 89, 0.15);
+}
 .check-item.ok .check-icon { color: #34c759; }
+
+.check-item.fail {
+  background: rgba(255, 59, 48, 0.06);
+  border-color: rgba(255, 59, 48, 0.15);
+}
 .check-item.fail .check-icon { color: #ff3b30; }
 
+/* ── Shortcuts (Step 3) ── */
 .shortcut-row {
   display: flex;
   align-items: center;
@@ -1925,49 +1989,206 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 28px;
-  height: 28px;
+  min-width: 30px;
+  height: 30px;
   padding: 0 8px;
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.04);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 8px;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro", sans-serif;
   font-size: 13px;
-  color: #e5e5ea;
+  font-weight: 500;
+  color: #1d1d1f;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
 }
 
 .shortcut-label {
   font-size: 13px;
-  color: #86868b;
+  color: #6e6e73;
   margin-left: 8px;
 }
 
 .onboarding-hint {
   font-size: 12px !important;
-  color: #86868b !important;
+  color: #6e6e73 !important;
   margin-top: 16px !important;
 }
 
-.onboarding-btn {
-  width: 100%;
-  padding: 12px 20px;
+/* ── Extension install box ── */
+.onboarding-extension-box {
+  margin-top: 18px;
+  padding: 14px 16px;
+  background: rgba(0, 122, 255, 0.04);
+  border: 1px solid rgba(0, 122, 255, 0.12);
+  border-radius: 14px;
+}
+.onboarding-extension-box .onboarding-hint {
+  margin-top: 0 !important;
+  margin-bottom: 10px !important;
+  line-height: 1.5;
+  color: #1d1d1f !important;
+}
+.onboarding-ext-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.onboarding-ext-btn {
+  flex: 1;
+  padding: 10px 14px;
   border: none;
-  border-radius: 12px;
+  border-radius: 10px;
   background: #007aff;
   color: white;
-  font-size: 14px;
+  font-size: 12px;
   font-weight: 600;
   cursor: pointer;
-  transition: background 0.2s;
+  transition: background 0.2s, transform 0.15s;
+}
+.onboarding-ext-btn:hover {
+  background: #0066d6;
+}
+.onboarding-ext-btn:active {
+  transform: scale(0.97);
+}
+.onboarding-ext-btn.secondary {
+  background: rgba(0, 0, 0, 0.04);
+  color: #48484a;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+}
+.onboarding-ext-btn.secondary:hover {
+  background: rgba(0, 0, 0, 0.07);
+}
+.onboarding-ext-steps {
+  font-size: 11px !important;
+  color: #6e6e73 !important;
+  margin: 0 !important;
+  line-height: 1.5;
+}
+.onboarding-ext-steps code {
+  background: rgba(0, 0, 0, 0.05);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #1d1d1f;
+}
+
+/* ── Primary action button (pill-shaped, like the app) ── */
+.onboarding-btn {
+  width: 100%;
+  padding: 13px 20px;
+  border: none;
+  border-radius: 14px;
+  background: #007aff;
+  color: white;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  transition: background 0.2s, transform 0.15s, box-shadow 0.2s;
+  box-shadow: 0 2px 12px -2px rgba(0, 122, 255, 0.35);
 }
 
 .onboarding-btn:hover {
   background: #0066d6;
+  box-shadow: 0 4px 16px -2px rgba(0, 122, 255, 0.40);
+}
+
+.onboarding-btn:active {
+  transform: scale(0.98);
+}
+
+.onboarding-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  box-shadow: none;
+  transform: none;
 }
 
 .onboarding-version {
-  margin-top: 16px;
+  margin-top: 18px;
   font-size: 11px;
-  color: #48484a;
+  color: #aeaeb2;
+  letter-spacing: 0.01em;
 }
 
+/* ── API key entry (Step 1) ── */
+.onboarding-apikey-box {
+  margin-top: 10px;
+}
+
+.onboarding-link {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 500;
+  color: #007aff;
+  text-decoration: none;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: color 0.2s;
+}
+
+.onboarding-link:hover {
+  color: #0066d6;
+  text-decoration: underline;
+}
+
+.onboarding-inline-link {
+  color: #007aff;
+  text-decoration: none;
+  cursor: pointer;
+  font-weight: 500;
+}
+.onboarding-inline-link:hover {
+  color: #0066d6;
+  text-decoration: underline;
+}
+
+.onboarding-input {
+  width: 100%;
+  padding: 12px 14px;
+  margin-top: 8px;
+  background: rgba(0, 0, 0, 0.03);
+  border: 1.5px solid rgba(0, 0, 0, 0.08);
+  border-radius: 12px;
+  color: #1d1d1f;
+  font-size: 13px;
+  font-family: "SF Mono", "Menlo", monospace;
+  outline: none;
+  box-sizing: border-box;
+  transition: border-color 0.25s, background 0.25s, box-shadow 0.25s;
+}
+
+.onboarding-input::placeholder {
+  color: #aeaeb2;
+}
+
+.onboarding-input:focus {
+  border-color: rgba(0, 122, 255, 0.45);
+  background: rgba(255, 255, 255, 0.6);
+  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.10);
+}
+
+.onboarding-input.onboarding-input-secondary {
+  opacity: 0.6;
+  font-size: 12px;
+}
+
+.onboarding-input.onboarding-input-secondary:focus {
+  opacity: 1;
+}
+
+/* ── Setup log (Step 2) ── */
+.onboarding-setup-log {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.03);
+  border: 1px solid rgba(0, 0, 0, 0.04);
+  border-radius: 10px;
+  font-size: 11px;
+  color: #6e6e73;
+  font-family: "SF Mono", "Menlo", monospace;
+  min-height: 24px;
+  line-height: 1.5;
+  transition: opacity 0.3s;
+}

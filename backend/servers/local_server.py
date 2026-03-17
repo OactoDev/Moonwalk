@@ -33,13 +33,19 @@ if _backend_dir not in sys.path:
 
 load_dotenv(os.path.join(_backend_dir, ".env"))
 
-# Voice libraries
-import pvporcupine
+# Voice libraries (soft import — server still starts if missing, wake word is just disabled)
+try:
+    import pvporcupine
+except ImportError:
+    pvporcupine = None
+    print("[Voice] pvporcupine not installed — wake word will be disabled")
 import speech_recognition as sr
 
 # Moonwalk Agent (V2 runtime)
 from agent import create_agent
 import agent.perception as perception
+from runtime_state import runtime_state_store
+from voice.tts import get_tts_engine, prepare_for_speech
 from servers.browser_bridge_server import BRIDGE_HOST, BRIDGE_PORT, bridge_handler
 from browser import BrowserResolver, browser_bridge, browser_store, ActionRequest
 from browser.selector_ai import build_ranked_candidates, select_browser_candidate_with_flash
@@ -73,28 +79,39 @@ class VoiceAssistant:
         
         # We try to initialize Porcupine, but it will fail if the key is default
         try:
-            if PICOVOICE_ACCESS_KEY != "YOUR_PICOVOICE_ACCESS_KEY_HERE":
+            if pvporcupine is None:
+                print("[Voice] ⚠ pvporcupine not available — wake word disabled")
+            elif not PICOVOICE_ACCESS_KEY or PICOVOICE_ACCESS_KEY == "YOUR_PICOVOICE_ACCESS_KEY_HERE":
+                print("[Voice] ⚠ Picovoice Access Key not set — wake word disabled")
+                print(f"[Voice]   PICOVOICE_ACCESS_KEY = '{PICOVOICE_ACCESS_KEY[:8]}…' (len={len(PICOVOICE_ACCESS_KEY)})")
+            else:
                 # Look for the .ppn file in the project root (one level above _backend_dir)
                 project_root = os.path.abspath(os.path.join(_backend_dir, ".."))
                 custom_ppn = os.path.join(project_root, "hey_moonwalk.ppn")
-                
-                if os.path.exists(custom_ppn):
+                # Also check inside the servers directory (bundled copy)
+                servers_ppn = os.path.join(os.path.dirname(__file__), "hey_moonwalk.ppn")
+                ppn_path = custom_ppn if os.path.exists(custom_ppn) else (servers_ppn if os.path.exists(servers_ppn) else None)
+
+                print(f"[Voice] Picovoice key: {PICOVOICE_ACCESS_KEY[:12]}… (len={len(PICOVOICE_ACCESS_KEY)})")
+                print(f"[Voice] PPn search: project_root={custom_ppn} exists={os.path.exists(custom_ppn)}")
+                print(f"[Voice] PPn search: servers_dir={servers_ppn} exists={os.path.exists(servers_ppn)}")
+
+                if ppn_path:
                     self.porcupine = pvporcupine.create(
                         access_key=PICOVOICE_ACCESS_KEY,
-                        keyword_paths=[custom_ppn]
+                        keyword_paths=[ppn_path]
                     )
-                    print(f"Porcupine initialized with CUSTOM wake word: 'Hey Moonwalk'")
+                    print(f"[Voice] ✓ Porcupine initialized with 'Hey Moonwalk' from {ppn_path}")
                 else:
                     self.porcupine = pvporcupine.create(
                         access_key=PICOVOICE_ACCESS_KEY,
                         keywords=["porcupine"]
                     )
-                    print(f"Porcupine initialized with built-in keyword 'Porcupine'.")
-                    print("NOTE: To use 'Hey Moonwalk', place 'hey_moonwalk.ppn' in the project root.")
-            else:
-                print("WARNING: Picovoice Access Key not set. Wake word detection will not work.")
+                    print("[Voice] ⚠ hey_moonwalk.ppn not found — using built-in 'Porcupine' keyword")
+                    print(f"[Voice]   Searched: {custom_ppn}")
+                    print(f"[Voice]   Searched: {servers_ppn}")
         except Exception as e:
-            print(f"Failed to initialize Porcupine: {e}")
+            print(f"[Voice] ✗ Porcupine init failed: {e}")
 
         # For capturing the command after wake
         self.audio_buffer = bytearray()
@@ -111,6 +128,13 @@ class VoiceAssistant:
         self.conversation_mode_timeout = 120  # seconds of silence before auto-off
         self._conversation_timer = None
 
+        # TTS state: mute mic while speaking to prevent feedback
+        self.tts_playing = False
+
+        # Active agent task for interrupt support
+        self._active_task: asyncio.Task | None = None
+        self._active_websocket = None
+
     async def run_agent_text(self, websocket, text: str):
         print(f"=> INPUT: {text}")
 
@@ -121,6 +145,9 @@ class VoiceAssistant:
                 print(f"[WS Callback] Error sending: {e}")
 
         context = await perception.snapshot(text)
+
+        # Pass conversation-mode flag so the agent can tailor responses
+        self.agent._conversation_mode = self.conversation_mode
 
         result = await self.agent.run(text, context, ws_callback=ws_callback)
 
@@ -143,6 +170,11 @@ class VoiceAssistant:
                 "type": "conversation_mode", "enabled": False
             }))
 
+        # Stream TTS for the response
+        clean_response = (response_text or "").replace("[CONVERSATION_MODE_ON]", "").replace("[CONVERSATION_MODE_OFF]", "").strip()
+        if clean_response:
+            await self._stream_tts(websocket, clean_response)
+
         if awaiting_reply:
             print("[Backend] Agent awaiting reply — listening without wake word")
             self.state = "LISTENING"
@@ -161,14 +193,110 @@ class VoiceAssistant:
             self.grace_chunks_remaining = 48
             self.waiting_for_voice = True
             self.waiting_for_reply = False
+            self._reset_conversation_timer()
             return
 
         self.waiting_for_reply = False
         self.state = "IDLE"
         self.audio_buffer = bytearray()
 
+    # ── TTS Streaming ──
+
+    async def _stream_tts(self, websocket, text: str):
+        """Stream TTS audio sentence-by-sentence to the renderer."""
+        if not text or len(text.strip()) < 3:
+            return
+        try:
+            tts = get_tts_engine()
+            speech_text = prepare_for_speech(text)
+            if not speech_text:
+                return
+
+            self.tts_playing = True
+            async for chunk in tts.stream_synthesize(speech_text):
+                msg = chunk.to_ws_message()
+                await websocket.send(json.dumps(msg))
+
+            await websocket.send(json.dumps({"type": "tts_done"}))
+        except Exception as e:
+            print(f"[TTS] Streaming error: {e}")
+        finally:
+            self.tts_playing = False
+
+    # ── Interrupt / Cancel ──
+
+    async def cancel_active_task(self, websocket=None):
+        """Cancel the currently running agent task."""
+        ws = websocket or self._active_websocket
+        print("[Backend] ⛔ Cancelling active task")
+        runtime_state_store.cancel_request()
+
+        if self._active_task and not self._active_task.done():
+            self._active_task.cancel()
+            self._active_task = None
+
+        # Stop any TTS playback on the renderer
+        self.tts_playing = False
+        if ws:
+            try:
+                await ws.send(json.dumps({"type": "tts_stop"}))
+                await ws.send(json.dumps({"type": "status", "state": "state-idle"}))
+            except Exception:
+                pass
+
+        self.state = "IDLE" if not self.conversation_mode else "LISTENING"
+
+    # ── Conversation Mode ──
+
+    def toggle_conversation_mode(self) -> bool:
+        """Toggle conversation mode on/off. Returns the new state."""
+        self.conversation_mode = not self.conversation_mode
+        if self.conversation_mode:
+            print("[Backend] 🗣 Conversation mode ENABLED (user toggle)")
+            self._reset_conversation_timer()
+        else:
+            print("[Backend] 🔇 Conversation mode DISABLED (user toggle)")
+            self._cancel_conversation_timer()
+        return self.conversation_mode
+
+    def _reset_conversation_timer(self):
+        """Reset the auto-off timer for conversation mode."""
+        self._cancel_conversation_timer()
+        loop = asyncio.get_event_loop()
+        self._conversation_timer = loop.call_later(
+            self.conversation_mode_timeout,
+            lambda: asyncio.ensure_future(self._conversation_timeout())
+        )
+
+    def _cancel_conversation_timer(self):
+        """Cancel any pending conversation mode timeout."""
+        if self._conversation_timer:
+            self._conversation_timer.cancel()
+            self._conversation_timer = None
+
+    async def _conversation_timeout(self):
+        """Auto-disable conversation mode after silence timeout."""
+        if not self.conversation_mode:
+            return
+        print(f"[Backend] ⏰ Conversation mode auto-off after {self.conversation_mode_timeout}s silence")
+        self.conversation_mode = False
+        self._conversation_timer = None
+        ws = self._active_websocket
+        if ws:
+            try:
+                await ws.send(json.dumps({"type": "conversation_mode", "enabled": False}))
+                if self.state != "DOING":
+                    self.state = "IDLE"
+                    await ws.send(json.dumps({"type": "status", "state": "state-idle"}))
+            except Exception:
+                pass
+
     async def handle_audio_chunk(self, websocket, b64_payload):
         """Decode base64 WAV, strip header, get raw PCM bytes."""
+        # Mute mic pipeline while TTS is playing to prevent feedback
+        if self.tts_playing:
+            return
+
         try:
             wav_bytes = base64.b64decode(b64_payload)
             
@@ -275,6 +403,31 @@ class VoiceAssistant:
                 print(f"=> TRANSCRIBED: {text}")
                 
                 # ════════════════════════════════════════════
+                #  Voice interrupt: if agent is working and user
+                #  says "stop"/"cancel", cancel the task instead
+                #  of queueing a new agent run.
+                # ════════════════════════════════════════════
+                _cancel_words = {"stop", "cancel", "never mind", "nevermind", "abort", "quit"}
+                if self.state == "DOING" or self._active_task and not self._active_task.done():
+                    normalized = text.strip().lower()
+                    if normalized in _cancel_words or any(normalized.startswith(w) for w in _cancel_words):
+                        print(f"[Backend] ⛔ Voice interrupt: '{text}' → cancelling task")
+                        await self.cancel_active_task(websocket)
+                        await websocket.send(json.dumps({
+                            "type": "response",
+                            "payload": {"text": "Stopped — let me know if you need anything else.", "app": ""}
+                        }))
+                        self.state = "IDLE" if not self.conversation_mode else "LISTENING"
+                        if self.conversation_mode:
+                            self.audio_buffer = bytearray()
+                            self.consecutive_silence_chunks = 0
+                            self.grace_chunks_remaining = 32
+                            self.waiting_for_voice = True
+                            self._reset_conversation_timer()
+                            await websocket.send(json.dumps({"type": "status", "state": "state-listening"}))
+                        return
+                
+                # ════════════════════════════════════════════
                 #  AGENTIC PIPELINE — This is where the magic happens
                 # ════════════════════════════════════════════
                 
@@ -349,6 +502,7 @@ class VoiceAssistant:
 async def main_handler(websocket):
     print("Electron App Connected!")
     assistant = VoiceAssistant()
+    assistant._active_websocket = websocket
     await assistant.agent.router.initialize()
 
     # Initialize UI
@@ -362,6 +516,31 @@ async def main_handler(websocket):
                 
                 if msg_type == "audio_chunk":
                     await assistant.handle_audio_chunk(websocket, data.get("payload", ""))
+                elif msg_type == "cancel_task":
+                    await assistant.cancel_active_task(websocket)
+                elif msg_type == "toggle_conversation_mode":
+                    enabled = assistant.toggle_conversation_mode()
+                    await websocket.send(json.dumps({
+                        "type": "conversation_mode", "enabled": enabled
+                    }))
+                    if enabled:
+                        # Immediately start listening (no wake word needed)
+                        assistant.state = "LISTENING"
+                        assistant.audio_buffer = bytearray()
+                        assistant.consecutive_silence_chunks = 0
+                        assistant.grace_chunks_remaining = 32
+                        assistant.waiting_for_voice = True
+                        await websocket.send(json.dumps({
+                            "type": "status", "state": "state-listening"
+                        }))
+                    else:
+                        assistant.state = "IDLE"
+                        await websocket.send(json.dumps({
+                            "type": "status", "state": "state-idle"
+                        }))
+                elif msg_type == "tts_done":
+                    # Renderer finished playing all TTS audio
+                    assistant.tts_playing = False
                 elif msg_type == "text_input":
                     text = (data.get("text") or "").strip()
                     if text:

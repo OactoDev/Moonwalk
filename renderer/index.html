@@ -50,6 +50,13 @@
         <span class="status-text" id="doing-text">Processing...</span>
       </div>
 
+      <!-- Stop / Cancel button (visible during DOING & LOADING) -->
+      <button class="pill-stop-btn hidden" id="pill-stop" aria-label="Stop task">
+        <svg width="10" height="10" viewBox="0 0 10 10">
+          <path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+        </svg>
+      </button>
+
     </div>
 
     <!-- Response Card (conversational answers — appears below pill) -->
@@ -179,22 +186,48 @@
     <div class="onboarding-overlay hidden" id="onboarding-overlay">
       <div class="onboarding-card">
         <div class="onboarding-header">
-          <svg class="onboarding-logo" viewBox="0 0 24 24" width="32" height="32">
-            <circle cx="12" cy="12" r="10" fill="none" stroke="#4c8dff" stroke-width="1.5"/>
-            <path d="M8 12 L11 15 L16 9" fill="none" stroke="#4c8dff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          <svg class="onboarding-logo" viewBox="0 0 40 40" width="44" height="44">
+            <defs>
+              <linearGradient id="ob-grad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#007aff"/>
+                <stop offset="100%" stop-color="#5ac8fa"/>
+              </linearGradient>
+            </defs>
+            <circle cx="20" cy="20" r="19" fill="url(#ob-grad)" opacity="0.10"/>
+            <path d="M24 10a12 12 0 01-1.5 20.8A10 10 0 0024 10z" fill="url(#ob-grad)" opacity="0.85"/>
           </svg>
           <h2 class="onboarding-title">Welcome to Moonwalk</h2>
           <p class="onboarding-subtitle">Your AI desktop assistant</p>
         </div>
 
-        <!-- Step 1: Setup -->
+        <!-- Step 1: API Key -->
         <div class="onboarding-step active" id="onboarding-step-1">
           <div class="onboarding-body">
-            <p>Moonwalk uses voice and text to help you with tasks on your Mac.</p>
+            <p>Moonwalk needs a <strong>Gemini API key</strong> to power its AI.<br/>Get one free at Google AI Studio — no credit card needed.</p>
+            <div class="onboarding-apikey-box">
+              <a href="#" id="onboarding-open-aistudio" class="onboarding-link">Get free key at aistudio.google.com →</a>
+              <input type="password" id="onboarding-gemini-key" class="onboarding-input"
+                     placeholder="Paste your Gemini API key" autocomplete="off" spellcheck="false" />
+              <p class="onboarding-ext-steps" style="margin-top:10px!important;">
+                <strong style="color:#34c759;">Wake word included ✅</strong> — "Hey Moonwalk" works out of the box.
+                Optionally replace with your own from
+                <a href="#" class="onboarding-inline-link" id="onboarding-open-picovoice">console.picovoice.ai</a>.
+              </p>
+              <input type="password" id="onboarding-picovoice-key" class="onboarding-input onboarding-input-secondary"
+                     placeholder="Picovoice key (pre-filled)" autocomplete="off" spellcheck="false" />
+            </div>
+          </div>
+          <button class="onboarding-btn" id="onboarding-next-0" disabled>Save &amp; Continue</button>
+        </div>
+
+        <!-- Step 2: Setup Checklist -->
+        <div class="onboarding-step" id="onboarding-step-2">
+          <div class="onboarding-body">
+            <p>Setting up Moonwalk — takes about 60 seconds the first time while Python dependencies install.</p>
             <div class="onboarding-checklist">
               <div class="check-item" id="check-python">
                 <span class="check-icon">⏳</span>
-                <span>Python backend</span>
+                <span>Python environment</span>
               </div>
               <div class="check-item" id="check-ws">
                 <span class="check-icon">⏳</span>
@@ -205,12 +238,13 @@
                 <span>Microphone access</span>
               </div>
             </div>
+            <div class="onboarding-setup-log" id="onboarding-setup-log"></div>
           </div>
-          <button class="onboarding-btn" id="onboarding-next-1">Continue</button>
+          <button class="onboarding-btn" id="onboarding-next-2" disabled>Continue</button>
         </div>
 
-        <!-- Step 2: Shortcuts -->
-        <div class="onboarding-step" id="onboarding-step-2">
+        <!-- Step 3: Shortcuts & Extension -->
+        <div class="onboarding-step" id="onboarding-step-3">
           <div class="onboarding-body">
             <div class="shortcut-row">
               <kbd>⌘</kbd><kbd>⇧</kbd><kbd>Space</kbd>
@@ -224,7 +258,24 @@
               <kbd>Esc</kbd>
               <span class="shortcut-label">Dismiss</span>
             </div>
-            <p class="onboarding-hint">Install the <strong>Moonwalk Browser Bridge</strong> Chrome extension for web automation.</p>
+
+            <div class="onboarding-extension-box">
+              <p class="onboarding-hint">
+                <strong>🧩 Chrome Extension</strong><br/>
+                Install the Browser Bridge to let Moonwalk search the web, fill forms, and interact with pages.
+              </p>
+              <div class="onboarding-ext-actions">
+                <button class="onboarding-ext-btn" id="onboarding-export-ext">
+                  📥 Save Extension to Downloads
+                </button>
+                <button class="onboarding-ext-btn secondary" id="onboarding-reveal-ext">
+                  📂 Show Extension Folder
+                </button>
+              </div>
+              <p class="onboarding-ext-steps">
+                After saving: Open Chrome → <code>chrome://extensions</code> → Enable Developer Mode → Load unpacked → Select the saved folder
+              </p>
+            </div>
           </div>
           <button class="onboarding-btn" id="onboarding-done">Get Started</button>
         </div>

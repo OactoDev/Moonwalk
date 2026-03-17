@@ -16,6 +16,8 @@ import json
 import time as _time
 import os
 import uuid
+import random as _random
+import re as _re
 from typing import Callable, Optional, Awaitable, List
 from functools import partial
 from dataclasses import dataclass, field
@@ -94,6 +96,17 @@ WEB_FLOW_TOOLS = {
 
 # Simplified system prompt for V2 (planning is done separately)
 SYSTEM_PROMPT_V2 = """You are Moonwalk, a macOS desktop assistant.
+
+## Personality & Tone
+- Warm, helpful, and efficient — like a capable friend, not a corporate bot.
+- Keep responses concise (1-3 sentences for simple tasks). Be direct.
+- Occasionally use light humor or personality, but never force it.
+- Use the user's name naturally when you know it (from profile).
+- Match the user's energy — enthusiastic with excited users, calm with
+  frustrated ones, casual with casual tone, professional when appropriate.
+- When something goes wrong, be empathetic and solution-focused.
+- Celebrate successes briefly ("Done!", "All set!") but don't be over-the-top.
+- Remember: you're voice-first. Write responses that sound natural when spoken aloud.
 
 ## Reasoning Protocol (MANDATORY)
 Before EVERY tool call you MUST include a `reasoning` argument — one sentence
@@ -303,6 +316,184 @@ class MoonwalkAgentV2:
         if any(_has_term(term) for term in approve_terms):
             return "approve"
         return "modify"
+
+    # ── Instant Acknowledgment ──────────────────────────────────
+
+    _ACK_ACTION = [
+        "On it!", "Sure thing", "Got it", "Working on it",
+        "One sec", "Right away", "Let me handle that",
+    ]
+    _ACK_QUESTION = [
+        "Let me check", "Good question", "Looking into it",
+        "One moment", "Let me find out",
+    ]
+    _ACK_RESEARCH = [
+        "Let me look into that", "Searching now",
+        "I'll dig into that", "Researching",
+    ]
+
+    def _pick_ack(self, user_text: str) -> str:
+        """Pick a natural acknowledgment phrase based on request type."""
+        lower = user_text.strip().lower()
+        # Questions
+        if any(lower.startswith(w) for w in ("what", "how", "why", "who", "where", "when", "is ", "are ", "can ", "do ", "does ")):
+            return _random.choice(self._ACK_QUESTION)
+        # Research-like
+        if any(w in lower for w in ("research", "find", "search", "look up", "compare")):
+            return _random.choice(self._ACK_RESEARCH)
+        # Default action
+        return _random.choice(self._ACK_ACTION)
+
+    # ── Small-Talk Fast Path ────────────────────────────────────
+
+    _GREETING_PATTERNS = _re.compile(
+        r"^\s*(?:hey|hi|hello|good\s+(?:morning|afternoon|evening)|howdy|sup|what'?s\s+up|yo)\s*[!.?]?\s*$",
+        _re.IGNORECASE,
+    )
+    _THANKS_PATTERNS = _re.compile(
+        r"^\s*(?:thanks?(?:\s+you)?|thank\s+you(?:\s+so\s+much)?|thx|cheers|appreciate\s+it)\s*[!.?]?\s*$",
+        _re.IGNORECASE,
+    )
+    _FAREWELL_PATTERNS = _re.compile(
+        r"^\s*(?:bye|goodbye|see\s+you|later|good\s*night|take\s+care|peace)\s*[!.?]?\s*$",
+        _re.IGNORECASE,
+    )
+    _MOOD_PATTERNS = _re.compile(
+        r"^\s*(?:how\s+are\s+you|how'?s\s+it\s+going|how\s+do\s+you\s+feel|are\s+you\s+there)\s*[?!.]?\s*$",
+        _re.IGNORECASE,
+    )
+    _SIMPLE_FACTUAL = _re.compile(
+        r"^\s*(?:what(?:'s| is)\s+the\s+(?:time|date|day)|what\s+time\s+is\s+it|what\s+day\s+is\s+(?:it|today))\s*[?]?\s*$",
+        _re.IGNORECASE,
+    )
+
+    def _is_conversational(self, text: str) -> str | None:
+        """
+        Classify if text is small-talk that can skip the full pipeline.
+        Returns the category string or None if it's a real task.
+        """
+        if self._GREETING_PATTERNS.match(text):
+            return "greeting"
+        if self._THANKS_PATTERNS.match(text):
+            return "thanks"
+        if self._FAREWELL_PATTERNS.match(text):
+            return "farewell"
+        if self._MOOD_PATTERNS.match(text):
+            return "mood"
+        if self._SIMPLE_FACTUAL.match(text):
+            return "factual"
+        return None
+
+    async def _try_conversational_fast_path(
+        self,
+        user_text: str,
+        context: perception.ContextSnapshot,
+        ws_callback: Optional[WSCallback] = None,
+    ) -> tuple | None:
+        """
+        Handle greetings, thanks, farewells, and simple questions
+        without going through the full routing/planning pipeline.
+        Returns (response_text, False) or None if not conversational.
+        """
+        category = self._is_conversational(user_text)
+        if not category:
+            return None
+
+        print(f"[AgentV2] 💬 Conversational fast path: {category}")
+
+        # Get user's name for personalization
+        user_name = self.user_profile.get_fact("name") or ""
+
+        # Use Flash for speed
+        provider = self.router.get("flash")
+        if not provider:
+            # Fallback to template responses
+            return self._template_chat_response(category, user_name)
+
+        # Build a lightweight conversational prompt
+        history = self.conversation.get_history()[-6:]
+        history_text = ""
+        for turn in history:
+            role = turn.get("role", "")
+            parts = turn.get("parts", [])
+            text = " ".join(p.get("text", "") for p in parts if isinstance(p, dict))
+            if text:
+                history_text += f"{'User' if role == 'user' else 'Moonwalk'}: {text}\n"
+
+        profile_hint = ""
+        if user_name:
+            profile_hint = f"The user's name is {user_name}. Use it naturally (not every time).\n"
+
+        system = (
+            "You are Moonwalk, a friendly macOS desktop assistant. "
+            "Keep responses short (1-2 sentences max), natural, and warm. "
+            "Sound like a helpful friend, not a corporate bot. "
+            "You're voice-first — write responses that sound natural when spoken aloud. "
+            f"{profile_hint}"
+        )
+
+        prompt = f"Conversation so far:\n{history_text}\nUser: {user_text}\n\nRespond naturally:"
+
+        try:
+            response = await provider.chat(
+                system_prompt=system,
+                messages=[{"role": "user", "parts": [{"text": prompt}]}],
+                temperature=0.7,
+            )
+            reply = (response.get("text", "") or "").strip()
+            if not reply:
+                return self._template_chat_response(category, user_name)
+        except Exception as e:
+            print(f"[AgentV2] Fast path LLM error: {e}")
+            return self._template_chat_response(category, user_name)
+
+        # Deliver the response
+        if ws_callback:
+            display = "pill" if len(reply) <= 60 else "card"
+            try:
+                await tool_registry.execute("send_response", {"message": reply})
+            except Exception:
+                pass
+            await ws_callback({
+                "type": "response",
+                "payload": {
+                    "text": reply,
+                    "display": display,
+                    "app": context.active_app.lower() if context.active_app else "",
+                },
+            })
+
+        self.conversation.add_model(reply)
+        return (reply, False)
+
+    def _template_chat_response(self, category: str, user_name: str = "") -> tuple:
+        """Fallback template responses when no LLM is available."""
+        name_suffix = f", {user_name}" if user_name else ""
+        templates = {
+            "greeting": [f"Hey{name_suffix}! What can I help with?", f"Hi{name_suffix}! Ready when you are.", "Hey! What's on your mind?"],
+            "thanks": ["Happy to help!", "Anytime!", "You got it!"],
+            "farewell": [f"See you{name_suffix}!", "Take care!", "Catch you later!"],
+            "mood": ["I'm doing great, thanks for asking! What can I help with?", "All good here! What's up?"],
+            "factual": ["Let me check that for you…"],
+        }
+        choices = templates.get(category, ["What can I help you with?"])
+        reply = _random.choice(choices)
+        self.conversation.add_model(reply)
+        return (reply, False)
+
+    def _suggest_followup(self, response: str, user_text: str) -> str:
+        """Return a brief proactive follow-up, or empty string to skip."""
+        suggestions = [
+            "Anything else I can help with?",
+            "Want me to do anything else with this?",
+            "Need anything else?",
+            "Let me know if you'd like to tweak anything.",
+            "Want me to continue with something related?",
+        ]
+        # Don't suggest if the response already asks a question
+        if response.rstrip().endswith("?"):
+            return ""
+        return _random.choice(suggestions)
 
     def _recent_conversation_snippet(self) -> str:
         recent_turns = self.conversation.get_history()[-6:]
@@ -632,6 +823,16 @@ class MoonwalkAgentV2:
         if extracted:
             print(f"[AgentV2] 📝 Extracted facts: {extracted}")
 
+        # ══════════════════════════════════════════════════════════════
+        # FAST PATH: Small-talk / conversational (skip full pipeline)
+        # ══════════════════════════════════════════════════════════════
+        if not self._pending_plan and not self._pending_execution:
+            chat_result = await self._try_conversational_fast_path(user_text, context, ws_callback)
+            if chat_result is not None:
+                elapsed = _time.time() - t_start
+                print(f"[AgentV2] ⚡ Fast path: {elapsed:.2f}s")
+                return chat_result
+
         # Stream "thinking" state to UI
         if ws_callback:
             await ws_callback({"type": "thinking"})
@@ -913,9 +1114,14 @@ class MoonwalkAgentV2:
             self._pending_reply_provider = None
             print(f"[AgentV2] Resuming with {provider.name}")
         else:
+            # ── Instant acknowledgment ──
+            if ws_callback:
+                ack = self._pick_ack(user_text)
+                await ws_callback({"type": "ack", "text": ack})
+
             # Immediate feedback while routing LLM runs
             if ws_callback:
-                await ws_callback({"type": "doing", "text": "Analyzing request…", "tool": "router"})
+                await ws_callback({"type": "doing", "text": "Analyzing…", "tool": "router"})
             try:
                 decision = await self.router.route(
                     planning_request,
@@ -1607,6 +1813,13 @@ class MoonwalkAgentV2:
             })
 
         self.conversation.add_model(final_response)
+
+        # ── Proactive follow-up (conversation mode only) ──
+        # Occasionally hint the user can keep talking
+        if getattr(self, '_conversation_mode', False) and plan.is_complete() and _random.random() < 0.35:
+            followup = self._suggest_followup(final_response, user_text)
+            if followup:
+                final_response = f"{final_response}\n\n{followup}"
 
         # Log research summary
         research_summary = self.working_memory.get_research_summary()

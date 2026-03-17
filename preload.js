@@ -25,4 +25,19 @@ contextBridge.exposeInMainWorld("overlayAPI", {
   // ── App info ──
   getVersion: () => ipcRenderer.invoke("app:get-version"),
   isPackaged: () => ipcRenderer.invoke("app:is-packaged"),
+
+  // ── Chrome Extension ──
+  exportExtension: () => ipcRenderer.invoke("extension:export"),
+  revealExtension: () => ipcRenderer.invoke("extension:reveal"),
+  openChromeExtensions: () => ipcRenderer.invoke("extension:open-chrome-extensions"),
+
+  // ── Backend lifecycle ──
+  startBackend: () => ipcRenderer.invoke("backend:start"),
+
+  // ── Setup progress (setup.sh stdout forwarded from main process) ──
+  onSetupProgress: (handler) => {
+    const wrapped = (_, text) => handler(text);
+    ipcRenderer.on("setup:progress", wrapped);
+    return () => ipcRenderer.removeListener("setup:progress", wrapped);
+  },
 });

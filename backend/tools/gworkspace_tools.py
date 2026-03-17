@@ -342,29 +342,39 @@ async def _wait_for_kix_rendered(timeout: float = 5.0) -> bool:
 
 
 async def _gdocs_set_title(title: str) -> bool:
+    """Set the Google Doc title.  DOM fast-path → vision fallback."""
     if not title:
         return True
+    # ── Fast path: DOM React-style value setter ──
     title_b64 = __import__("base64").b64encode(title.encode("utf-8")).decode("ascii")
     result = await _bridge_extract(f"gdocs_set_title:{title_b64}", timeout=4.0)
-    return bool(result and title in result)
+    if result and title in str(result):
+        print(f"[_gdocs_set_title] ✓ Title set via DOM bridge")
+        return True
+    # ── Reliable path: vision-based title entry ──
+    print("[_gdocs_set_title] DOM title setter failed — using vision")
+    return await _vision_gdocs_set_title(title)
 
 
 async def _gdocs_focus_editor() -> bool:
+    """Focus the Google Docs editor.  DOM fast-path → vision fallback.
+
+    The DOM selectors (kix-page, kix-appview-editor …) break whenever
+    Google ships an internal CSS rename.  Vision is immune to that.
+    """
+    # ── Fast path: DOM-based focus via bridge (0 latency) ──
     result = await _bridge_extract("gdocs_focus_editor", timeout=4.0)
-    if result and result.strip():
+    if result and result.strip() and result.strip() != "no-editor":
         click_result = await _bridge_extract("gdocs_click_editor", timeout=4.0)
-        if click_result and click_result.strip():
+        if click_result and click_result.strip() and click_result.strip() != "no-editor":
+            print("[_gdocs_focus_editor] ✓ Focused via DOM bridge")
             return True
+
+    # ── Reliable path: vision-based click on the editor page ──
+    print("[_gdocs_focus_editor] DOM focus failed — using vision")
     await _osascript('tell application "Google Chrome" to activate')
-    await asyncio.sleep(0.1)
-    await _osascript('tell application "System Events" to keystroke "f6"')
-    await asyncio.sleep(0.2)
-    await _osascript('tell application "System Events" to key code 48')
-    await asyncio.sleep(0.2)
-    click_result = await _bridge_extract("gdocs_click_editor", timeout=4.0)
-    if click_result and click_result.strip():
-        return True
-    return True
+    await asyncio.sleep(0.3)
+    return await _gdocs_focus_editor_with_vision()
 
 
 def _normalize_doc_text(text: str) -> str:
@@ -377,16 +387,32 @@ def _extract_doc_id_from_url(url: str) -> str:
 
 
 async def _gdocs_read_body() -> str:
-    # Wait for kix canvas to render before querying DOM selectors — on freshly
-    # opened docs the kix editor initialises asynchronously and returns empty
-    # text until editor_ready is True.
+    """Read the body of the current Google Doc.
+
+    Channels (tried in order):
+    1. DOM selectors via bridge  — fast, 0 tokens, but breaks on canvas docs
+    2. Clipboard extraction      — reliable for most docs
+    3. Vision OCR                 — always works, ~500 tokens
+    """
+    # ── Channel 1: DOM bridge extraction ──
     await _wait_for_kix_rendered(timeout=5.0)
     raw = await _bridge_extract("gdocs_read_body", timeout=4.0)
     if raw and len(_normalize_doc_text(raw)) >= 12:
+        print(f"[_gdocs_read_body] ✓ Read {len(raw)} chars via DOM bridge")
         return raw
+
+    # ── Channel 2: Clipboard (Cmd+A → Cmd+C → pbpaste) ──
     await _gdocs_focus_editor()
     await asyncio.sleep(0.2)
-    return await _copy_text()
+    clipboard_text = await _copy_text()
+    if clipboard_text and len(_normalize_doc_text(clipboard_text)) >= 12:
+        print(f"[_gdocs_read_body] ✓ Read {len(clipboard_text)} chars via clipboard")
+        return clipboard_text
+
+    # ── Channel 3: Vision OCR fallback (canvas-based docs) ──
+    print("[_gdocs_read_body] DOM + clipboard both empty — falling back to vision")
+    vision_text = await _vision_gdocs_read_content()
+    return vision_text or clipboard_text or ""
 
 
 def _body_matches_expected(actual: str, expected: str) -> bool:
@@ -406,28 +432,38 @@ def _body_matches_expected(actual: str, expected: str) -> bool:
 
 
 async def _gdocs_replace_body(body: str) -> bool:
+    """Replace the Google Doc body.  Tries DOM focus first, then vision focus,
+    with vision-based content verification for maximum reliability."""
     if not body:
         return True
     await _osascript('tell application "Google Chrome" to activate')
-    await _gdocs_focus_editor()
     await asyncio.sleep(0.2)
-    await _osascript('tell application "System Events" to keystroke "a" using command down')
-    await asyncio.sleep(0.15)
-    await _paste_html(body)
-    await asyncio.sleep(2.5)
-    readback = await _gdocs_read_body()
-    if _body_matches_expected(readback, body):
-        return True
 
-    if await _gdocs_focus_editor_with_vision():
-        await asyncio.sleep(0.2)
+    for attempt, focus_fn in enumerate([
+        _gdocs_focus_editor,              # attempt 0: DOM fast-path → vision fallback
+        _gdocs_focus_editor_with_vision,  # attempt 1: pure vision focus (fresh screenshot)
+    ], start=1):
+        print(f"[_gdocs_replace_body] Attempt {attempt}/2")
+        focused = await focus_fn()
+        if not focused and attempt == 1:
+            continue  # skip to vision retry
+        await asyncio.sleep(0.3)
+        # Select all + paste
         await _osascript('tell application "System Events" to keystroke "a" using command down')
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.2)
         await _paste_html(body)
         await asyncio.sleep(2.5)
+
+        # ── Verify: DOM read-back first (fast), then vision verify (reliable) ──
         readback = await _gdocs_read_body()
         if _body_matches_expected(readback, body):
+            print(f"[_gdocs_replace_body] ✓ Verified via DOM readback (attempt {attempt})")
             return True
+        # DOM readback may fail on canvas docs — ask vision to confirm
+        if await _vision_verify_content(body):
+            print(f"[_gdocs_replace_body] ✓ Verified via vision (attempt {attempt})")
+            return True
+        print(f"[_gdocs_replace_body] ✗ Attempt {attempt} paste not verified")
 
     return False
 
@@ -441,28 +477,36 @@ async def _open_gdoc_url(url: str) -> dict:
 
 
 async def _gdocs_append_body(text: str) -> bool:
+    """Append text to the end of a Google Doc.  Vision-verified with retry."""
     if not text:
         return True
     await _osascript('tell application "Google Chrome" to activate')
-    await _gdocs_focus_editor()
     await asyncio.sleep(0.2)
-    await _osascript('tell application "System Events" to key code 119 using command down')
-    await asyncio.sleep(0.25)
-    await _paste_html("\n" + text)
-    await asyncio.sleep(2.5)
-    readback = await _gdocs_read_body()
-    if _body_matches_expected(readback, text):
-        return True
 
-    if await _gdocs_focus_editor_with_vision():
-        await asyncio.sleep(0.2)
+    for attempt, focus_fn in enumerate([
+        _gdocs_focus_editor,              # attempt 0: DOM fast-path → vision fallback
+        _gdocs_focus_editor_with_vision,  # attempt 1: pure vision focus
+    ], start=1):
+        print(f"[_gdocs_append_body] Attempt {attempt}/2")
+        focused = await focus_fn()
+        if not focused and attempt == 1:
+            continue
+        await asyncio.sleep(0.3)
+        # Move to end of document
         await _osascript('tell application "System Events" to key code 119 using command down')
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.3)
         await _paste_html("\n" + text)
         await asyncio.sleep(2.5)
+
+        # ── Verify: DOM read-back first (fast), then vision verify (reliable) ──
         readback = await _gdocs_read_body()
         if _body_matches_expected(readback, text):
+            print(f"[_gdocs_append_body] ✓ Verified via DOM readback (attempt {attempt})")
             return True
+        if await _vision_verify_content(text):
+            print(f"[_gdocs_append_body] ✓ Verified via vision (attempt {attempt})")
+            return True
+        print(f"[_gdocs_append_body] ✗ Attempt {attempt} paste not verified")
 
     return False
 
@@ -474,28 +518,126 @@ def _extract_visual_coordinates(screen_result: str) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2))
 
 
-async def _gdocs_focus_editor_with_vision() -> bool:
-    prompt = (
-        "Find the main writable Google Docs page area where pasted document text should go. "
-        "Return one precise coordinate pair like (x, y) near the center of the writable page, "
-        "not the toolbar, title field, comments, or sidebar."
+# ═══════════════════════════════════════════════════════════════
+#  Vision-first GDocs helpers
+# ═══════════════════════════════════════════════════════════════
+
+async def _vision_locate_and_click(description: str, hint: str = "") -> bool:
+    """Use Gemini Vision to find a UI element on screen and click it.
+
+    Uses _fast_visual_locate (screenshot → Gemini Flash → coordinates)
+    which is immune to DOM class-name changes in Google Docs.
+
+    Returns True if element was found and clicked.
+    """
+    try:
+        from tools.mac_tools import _fast_visual_locate
+        coords = await _fast_visual_locate(description, hint=hint)
+        if not coords:
+            print(f"[_vision_locate_and_click] ✗ Could not find: {description[:60]}")
+            return False
+        x, y = coords
+        result = await registry.execute("click_element", {"x": x, "y": y})
+        ok = "failed" not in str(result or "").lower()
+        print(f"[_vision_locate_and_click] {'✓' if ok else '✗'} Click at ({x},{y}) for: {description[:60]}")
+        return ok
+    except Exception as e:
+        print(f"[_vision_locate_and_click] ⚠ Error: {e}")
+        return False
+
+
+async def _vision_gdocs_set_title(title: str) -> bool:
+    """Use vision to find the Google Docs title field, click it, clear it, and type the title."""
+    if not title:
+        return True
+    print(f"[_vision_gdocs_set_title] Setting title via vision: {title[:50]}")
+    clicked = await _vision_locate_and_click(
+        "the document title input field at the top of the Google Doc — "
+        "it usually says 'Untitled document' or shows the current document title, "
+        "located above the menu bar (File, Edit, View)",
+        hint="Google Docs title area, very top of the page, above toolbar"
+    )
+    if not clicked:
+        print("[_vision_gdocs_set_title] ✗ Could not locate title field via vision")
+        return False
+    await asyncio.sleep(0.4)
+    # Triple-click to select all text in the title field
+    await _osascript('tell application "System Events" to keystroke "a" using command down')
+    await asyncio.sleep(0.15)
+    # Type the new title via clipboard paste (handles special chars)
+    await _paste_text(title)
+    await asyncio.sleep(0.4)
+    # Press Tab to confirm title and move focus away
+    await _osascript('tell application "System Events" to key code 48')  # Tab
+    await asyncio.sleep(0.3)
+    print(f"[_vision_gdocs_set_title] ✓ Title typed via vision")
+    return True
+
+
+async def _vision_verify_content(expected_snippet: str) -> bool:
+    """Take a screenshot and ask Vision if the expected content is visible in the document.
+
+    This is the most reliable way to verify paste/type operations because
+    it sees the actual rendered pixels, not DOM nodes that may be stale.
+    """
+    if not expected_snippet:
+        return True
+    # Use a concise snippet for the check (first 200 chars is enough)
+    snippet = expected_snippet[:200].replace('\n', ' ').strip()
+    question = (
+        f"Look at the Google Doc editor area on screen. "
+        f"Does the document body contain text that matches or closely resembles this?\n\n"
+        f"\"{snippet}\"\n\n"
+        f"Answer ONLY 'YES' or 'NO'."
     )
     try:
-        screen_result = await registry.execute("read_screen", {"question": prompt})
-    except Exception:
+        result = await registry.execute("read_screen", {"question": question})
+        answer = str(result or "").strip().upper()
+        found = answer.startswith("YES") or "YES" in answer
+        print(f"[_vision_verify_content] {'✓' if found else '✗'} Vision says: {answer[:20]}")
+        return found
+    except Exception as e:
+        print(f"[_vision_verify_content] ⚠ Error: {e}")
         return False
 
-    coords = _extract_visual_coordinates(screen_result)
-    if not coords:
-        return False
 
-    x, y = coords
+async def _vision_gdocs_read_content() -> str:
+    """Use vision to read the content visible in the Google Doc.
+
+    Fallback for when DOM-based body extraction returns empty
+    (e.g. canvas-based Google Docs rendering).
+    """
+    question = (
+        "Read and transcribe ALL the text content visible in the Google Doc editor area. "
+        "Include all paragraphs, headings, lists, and any other text. "
+        "Do NOT include toolbar text, menu items, sidebar content, or UI labels. "
+        "Return ONLY the document text content, nothing else."
+    )
     try:
-        click_result = await registry.execute("click_element", {"x": x, "y": y})
-    except Exception:
-        return False
+        result = await registry.execute("read_screen", {"question": question})
+        text = str(result or "").strip()
+        if text and not text.startswith("ERROR"):
+            print(f"[_vision_gdocs_read_content] ✓ Read {len(text)} chars via vision")
+            return text
+        print(f"[_vision_gdocs_read_content] ✗ Vision returned empty or error")
+        return ""
+    except Exception as e:
+        print(f"[_vision_gdocs_read_content] ⚠ Error: {e}")
+        return ""
 
-    return "failed" not in str(click_result or "").lower()
+
+async def _gdocs_focus_editor_with_vision() -> bool:
+    """Use Gemini Vision to find and click the Google Docs editor body.
+
+    This is the most reliable way to place the cursor in the editor
+    because it works regardless of DOM class-name changes.
+    """
+    return await _vision_locate_and_click(
+        "the main white writable page area in the center of the Google Doc "
+        "where typed/pasted document text should appear — not the toolbar, "
+        "not the title field at the top, not comments, not any sidebar",
+        hint="Center of the Google Docs editor page body"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -651,19 +793,20 @@ async def gdocs_read(doc_url_or_id: str) -> str:
                            "char_count": len(full_text),
                            "text": full_text[:12000]}, ensure_ascii=False)
 
-    # Fallback 1: use AppleScript to copy text directly via the clipboard
-    # This securely reads the internal Canvas content without an API token
-    text = await _copy_text()
-    
-    if text:
+    # Fallback: DOM bridge → clipboard → vision OCR cascade
+    # _gdocs_read_body focuses the editor before clipboard copy and falls
+    # back to Gemini Vision OCR for canvas-based docs.
+    text = await _gdocs_read_body()
+
+    if text and len(_normalize_doc_text(text)) >= 5:
         return json.dumps({"ok": True, "doc_id": doc_id,
                            "text": text[:8000],
-                           "note": "Read via clipboard extraction (no API token). "
+                           "note": "Read via browser automation (DOM/clipboard/vision). "
                                    "For full fidelity set up OAuth in ~/.moonwalk/gcloud_token.json."},
                           ensure_ascii=False)
 
     return json.dumps({"ok": False, "doc_id": doc_id,
-                       "error": "Failed to read document using clipboard extraction.",
+                       "error": "Failed to read document content (DOM, clipboard, and vision all returned empty).",
                        "note": "For full fidelity and reliability without the browser extension, "
                                "set up OAuth in ~/.moonwalk/gcloud_token.json."},
                       ensure_ascii=False)
@@ -1891,6 +2034,7 @@ async def gworkspace_analyze(doc_url_or_id: str = "", focus: str = "summary") ->
 
     # ── Determine document type from URL or active page ──
     doc_type = ""
+    active_url = ""
     if doc_url_or_id:
         lower = doc_url_or_id.lower()
         if "document" in lower or "docs.new" in lower:
@@ -1899,19 +2043,23 @@ async def gworkspace_analyze(doc_url_or_id: str = "", focus: str = "summary") ->
             doc_type = "sheets"
         elif "presentation" in lower or "slides" in lower:
             doc_type = "slides"
-    else:
-        # Detect from active Chrome tab
+
+    # Always check the active Chrome tab — helps when a bare ID is passed
+    # (no URL keywords to match) or when no URL is given at all.
+    if not doc_type or not doc_url_or_id:
         active_url = await _osascript(
             'tell application "Google Chrome" to get URL of active tab of front window'
         )
         if active_url:
-            doc_id = _extract_doc_id(active_url)
-            if "document" in active_url:
-                doc_type = "docs"
-            elif "spreadsheet" in active_url or "sheets" in active_url:
-                doc_type = "sheets"
-            elif "presentation" in active_url or "slides" in active_url:
-                doc_type = "slides"
+            if not doc_id:
+                doc_id = _extract_doc_id(active_url)
+            if not doc_type:
+                if "document" in active_url or "docs.google.com" in active_url:
+                    doc_type = "docs"
+                elif "spreadsheet" in active_url or "sheets" in active_url:
+                    doc_type = "sheets"
+                elif "presentation" in active_url or "slides" in active_url:
+                    doc_type = "slides"
             analysis["detected_url"] = active_url
 
     analysis["doc_type"] = doc_type or "unknown"
@@ -1980,11 +2128,13 @@ async def gworkspace_analyze(doc_url_or_id: str = "", focus: str = "summary") ->
 
         analysis["method"] = "rest_api"
     else:
-        # ── Channel 2: DOM/Clipboard extraction fallback ──
+        # ── Channel 2: DOM/Clipboard/Vision extraction fallback ──
         if doc_type == "docs":
-            text = await _copy_text()
-            analysis["method"] = "clipboard"
+            # _gdocs_read_body: DOM bridge → focused clipboard → vision OCR
+            text = await _gdocs_read_body()
+            analysis["method"] = "gdocs_read_body"
         else:
+            # For Sheets/Slides/unknown, try bridge body then generic DOM
             text = await _bridge_extract("body")
             if text is not None:
                 analysis["method"] = "browser_bridge"
@@ -1992,6 +2142,17 @@ async def gworkspace_analyze(doc_url_or_id: str = "", focus: str = "summary") ->
                 js = "(function(){var t=document.body.innerText;return t?t.substring(0,8000):''})()"
                 text = await _chrome_js(js)
                 analysis["method"] = "browser_dom"
+
+            # If the bridge returned mostly toolbar/UI text for what might be a doc,
+            # fall back to the proper doc-body reader
+            if text and active_url and "docs.google.com/document" in active_url:
+                if text.startswith("Untitled document") or text.startswith("Close menu"):
+                    print("[gworkspace_analyze] Detected toolbar text — retrying with _gdocs_read_body")
+                    doc_text = await _gdocs_read_body()
+                    if doc_text and len(_normalize_doc_text(doc_text)) > len(_normalize_doc_text(text or "")):
+                        text = doc_text
+                        analysis["method"] = "gdocs_read_body_fallback"
+
         analysis["text_preview"] = (text or "")[:8000]
 
     analysis["ok"] = True

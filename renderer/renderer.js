@@ -46,6 +46,7 @@ const commandPanel = document.getElementById("command-panel");
 const commandInput = document.getElementById("command-input");
 const commandSend = document.getElementById("command-panel-send");
 const commandClose = document.getElementById("command-panel-close");
+const pillStopBtn = document.getElementById("pill-stop");
 
 /* ── Modal DOM Refs ── */
 const modalRich = document.getElementById("modal-rich");
@@ -123,6 +124,12 @@ const app = {
 
   // Conversation mode
   conversationMode: false,
+
+  // TTS audio playback
+  ttsAudioContext: null,
+  ttsQueue: [],           // queued AudioBuffers
+  ttsPlaying: false,
+  ttsCurrentSource: null, // currently playing AudioBufferSourceNode
 
   // Agent tracking
   agents: {},           // id -> agent state
@@ -210,6 +217,12 @@ function setState(next, { tier = "", text = null, appName = "", iconUrl = "", fo
   // AI Analysis mode — drives the glassmorphism "active analysis" visuals
   glow.classList.toggle('analyzing', next === State.DOING || next === State.LOADING);
   if (stageEl) stageEl.classList.toggle('analyzing', next === State.DOING);
+
+  // Show stop button when agent is working
+  if (pillStopBtn) {
+    const working = next === State.DOING || next === State.LOADING;
+    pillStopBtn.classList.toggle('hidden', !working);
+  }
 }
 
 function clearCommandContext() {
@@ -476,6 +489,14 @@ responseDismissEl.addEventListener('click', () => {
   setState(State.IDLE, { force: true });
   clearCommandContext();
 });
+
+// Stop-task button on pill
+if (pillStopBtn) {
+  pillStopBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    cancelActiveTask();
+  });
+}
 
 if (commandSend) {
   commandSend.addEventListener("click", () => {
@@ -1143,6 +1164,84 @@ async function stopAudioStreaming() {
 }
 
 
+/* ── TTS Audio Playback ── */
+
+function getTTSContext() {
+  if (!app.ttsAudioContext || app.ttsAudioContext.state === 'closed') {
+    app.ttsAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  return app.ttsAudioContext;
+}
+
+async function handleTTSChunk(data) {
+  try {
+    const audioBytes = Uint8Array.from(atob(data.data), c => c.charCodeAt(0));
+    const ctx = getTTSContext();
+    const audioBuffer = await ctx.decodeAudioData(audioBytes.buffer.slice(0));
+    app.ttsQueue.push(audioBuffer);
+
+    // Start playing if not already
+    if (!app.ttsPlaying) {
+      playNextTTSChunk();
+    }
+  } catch (err) {
+    console.error('[TTS] Decode error:', err);
+  }
+}
+
+function playNextTTSChunk() {
+  if (app.ttsQueue.length === 0) {
+    app.ttsPlaying = false;
+    app.ttsCurrentSource = null;
+    // Remove speaking variant
+    wrapper.classList.remove('variant-speaking');
+    // Notify backend TTS playback is done
+    if (app.ws && app.ws.readyState === WebSocket.OPEN) {
+      app.ws.send(JSON.stringify({ type: 'tts_done' }));
+    }
+    return;
+  }
+
+  app.ttsPlaying = true;
+  wrapper.classList.add('variant-speaking');
+
+  const ctx = getTTSContext();
+  const buffer = app.ttsQueue.shift();
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(ctx.destination);
+  source.onended = () => playNextTTSChunk();
+  source.start(0);
+  app.ttsCurrentSource = source;
+}
+
+function stopTTS() {
+  app.ttsQueue = [];
+  if (app.ttsCurrentSource) {
+    try { app.ttsCurrentSource.stop(); } catch {}
+    app.ttsCurrentSource = null;
+  }
+  app.ttsPlaying = false;
+  wrapper.classList.remove('variant-speaking');
+}
+
+/* ── Cancel / Stop Active Task ── */
+
+function cancelActiveTask() {
+  if (!app.ws || app.ws.readyState !== WebSocket.OPEN) return;
+  app.ws.send(JSON.stringify({ type: 'cancel_task' }));
+  stopTTS();
+}
+
+/* ── Conversation Mode Toggle ── */
+
+function toggleConversationMode() {
+  if (!app.ws || app.ws.readyState !== WebSocket.OPEN) return;
+  app.conversationMode = !app.conversationMode;
+  app.ws.send(JSON.stringify({ type: 'toggle_conversation_mode' }));
+}
+
+
 /* ── WebSocket ── */
 
 function scheduleReconnect() {
@@ -1163,6 +1262,11 @@ function connectWebSocket() {
     app.ws.addEventListener("open", () => {
       app.reconnectDelay = 700;
       statusEl.innerText = "Hey Moonwalk";
+      // (Re-)start audio streaming now that the WS is connected.
+      // This handles the case where getUserMedia failed at boot (before
+      // mic permission was granted during onboarding) or where the WS
+      // reconnected after a disconnect.
+      startAudioStreaming();
     });
 
     app.ws.addEventListener("message", (event) => {
@@ -1217,15 +1321,38 @@ function connectWebSocket() {
         return;
       }
 
-      // 3b. "conversation_mode" — Toggle persistent listening mode
+      // 3a. "ack" — Quick acknowledgment before work starts
+      if (msg.type === "ack") {
+        const ackText = msg.text || "On it";
+        // Briefly show ack text in the pill during loading transition
+        doingTextEl.innerText = ackText;
+        setState(State.DOING, { text: ackText, variant: "", force: true });
+        // Auto-transition to loading after a beat
+        setTimeout(() => {
+          if (app.current === State.DOING && doingTextEl.innerText === ackText) {
+            setState(State.LOADING, { force: true });
+          }
+        }, 800);
+        return;
+      }
+
+      // 3b. TTS audio streaming
+      if (msg.type === "tts_chunk") {
+        handleTTSChunk(msg);
+        return;
+      }
+      if (msg.type === "tts_stop") {
+        stopTTS();
+        return;
+      }
+      if (msg.type === "tts_done" && !app.ttsPlaying) {
+        // Backend says TTS is done sending — queue is already empty
+        return;
+      }
+
+      // 3c. "conversation_mode" — Toggle persistent listening mode
       if (msg.type === "conversation_mode") {
         app.conversationMode = !!msg.enabled;
-        const pill = document.getElementById("ui-wrapper");
-        if (app.conversationMode) {
-          pill.classList.add('conversation-mode');
-        } else {
-          pill.classList.remove('conversation-mode');
-        }
         return;
       }
 
@@ -1267,6 +1394,9 @@ function connectWebSocket() {
 /* ── Events ── */
 // Hit-test: check if mouse is over any interactive element
 function isOverInteractive(event) {
+  // Onboarding is a full-screen modal — always interactive while visible
+  if (onboardingOverlay && !onboardingOverlay.classList.contains("hidden")) return true;
+
   const x = event.clientX;
   const y = event.clientY;
   const rects = [wrapper.getBoundingClientRect()];
@@ -1290,6 +1420,17 @@ document.addEventListener("mousemove", (event) => {
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
+    // If agent is working, cancel the task
+    if (app.current === State.DOING || app.current === State.LOADING) {
+      cancelActiveTask();
+      setState(State.IDLE, { force: true });
+      return;
+    }
+    // If TTS is playing, stop it
+    if (app.ttsPlaying) {
+      stopTTS();
+      return;
+    }
     if (app.commandPanelOpen) return closeCommandPanel();
     return bridge.hideWindow();
   }
@@ -1324,82 +1465,183 @@ window.addEventListener("beforeunload", async () => {
 const onboardingOverlay = document.getElementById("onboarding-overlay");
 const onboardingStep1 = document.getElementById("onboarding-step-1");
 const onboardingStep2 = document.getElementById("onboarding-step-2");
-const onboardingNext1 = document.getElementById("onboarding-next-1");
-const onboardingDone = document.getElementById("onboarding-done");
+const onboardingStep3 = document.getElementById("onboarding-step-3");
 const onboardingVersion = document.getElementById("onboarding-version");
 
 async function runOnboarding() {
-  // Check if this is first launch
   const isFirst = await bridge.isFirstLaunch?.() ?? false;
   if (!isFirst) return;
 
-  // Show version
   const version = await bridge.getVersion?.() ?? "1.0.0";
   if (onboardingVersion) onboardingVersion.textContent = `v${version}`;
 
-  // Show overlay
   setMouseEnabled(true);
   onboardingOverlay.classList.remove("hidden");
-
-  // Run health checks
-  const checkPython = document.getElementById("check-python");
-  const checkWs = document.getElementById("check-ws");
-  const checkMic = document.getElementById("check-mic");
-
-  // Check Python backend
-  setTimeout(() => {
-    if (app.ws && app.ws.readyState === WebSocket.OPEN) {
-      checkPython.classList.add("ok");
-      checkPython.querySelector(".check-icon").textContent = "✓";
-    } else {
-      checkPython.classList.add("ok");
-      checkPython.querySelector(".check-icon").textContent = "✓";
-    }
-  }, 1500);
-
-  // Check WebSocket
-  setTimeout(() => {
-    if (app.ws && app.ws.readyState === WebSocket.OPEN) {
-      checkWs.classList.add("ok");
-      checkWs.querySelector(".check-icon").textContent = "✓";
-    } else {
-      checkWs.classList.add("fail");
-      checkWs.querySelector(".check-icon").textContent = "✗";
-    }
-  }, 2500);
-
-  // Check microphone
-  setTimeout(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach(t => t.stop());
-      checkMic.classList.add("ok");
-      checkMic.querySelector(".check-icon").textContent = "✓";
-    } catch {
-      checkMic.classList.add("fail");
-      checkMic.querySelector(".check-icon").textContent = "✗";
-    }
-  }, 1000);
-
-  // Generate and save credentials
-  const creds = await bridge.generateUserId?.();
-  if (creds) {
-    await bridge.saveCredentials?.(creds);
-  }
 }
 
-if (onboardingNext1) {
-  onboardingNext1.addEventListener("click", () => {
-    onboardingStep1.classList.remove("active");
-    onboardingStep2.classList.add("active");
+// ── Step 1: API Key entry ──
+const geminiKeyInput = document.getElementById("onboarding-gemini-key");
+const picovoiceKeyInput = document.getElementById("onboarding-picovoice-key");
+const next0Btn = document.getElementById("onboarding-next-0");
+const openAiStudioLink = document.getElementById("onboarding-open-aistudio");
+
+if (geminiKeyInput) {
+  geminiKeyInput.addEventListener("input", () => {
+    if (next0Btn) next0Btn.disabled = geminiKeyInput.value.trim().length < 10;
   });
 }
+
+// Pre-fill the bundled Picovoice key so wake word works out of the box
+const BUNDLED_PICOVOICE_KEY = "lDvqq7J641WbqdzMsPCdLlawELhfGZOGhaceFzl3ZYYYzeeuXq55YA==";
+if (picovoiceKeyInput) picovoiceKeyInput.value = BUNDLED_PICOVOICE_KEY;
+
+if (openAiStudioLink) {
+  openAiStudioLink.addEventListener("click", (e) => {
+    e.preventDefault();
+    window.open("https://aistudio.google.com/app/apikey");
+  });
+}
+
+const openPicovoiceLink = document.getElementById("onboarding-open-picovoice");
+if (openPicovoiceLink) {
+  openPicovoiceLink.addEventListener("click", (e) => {
+    e.preventDefault();
+    window.open("https://console.picovoice.ai");
+  });
+}
+
+if (next0Btn) {
+  next0Btn.addEventListener("click", async () => {
+    const geminiKey = geminiKeyInput?.value.trim() ?? "";
+    if (!geminiKey) return;
+
+    next0Btn.disabled = true;
+    next0Btn.textContent = "Saving…";
+
+    // Merge with any existing credentials and save
+    const existing = await bridge.loadCredentials?.() ?? {};
+    const picoKey = picovoiceKeyInput?.value.trim() ?? "";
+    const newCreds = {
+      ...existing,
+      gemini_api_key: geminiKey,
+      ...(picoKey && { picovoice_key: picoKey }),
+    };
+    await bridge.saveCredentials?.(newCreds);
+
+    // Transition to checklist step and start backend
+    onboardingStep1.classList.remove("active");
+    onboardingStep2.classList.add("active");
+    runSetupChecklist();
+  });
+}
+
+// ── Step 2: Setup checklist ──
+const checkPythonEl = document.getElementById("check-python");
+const checkWsEl = document.getElementById("check-ws");
+const checkMicEl = document.getElementById("check-mic");
+const setupLogEl = document.getElementById("onboarding-setup-log");
+const next2Btn = document.getElementById("onboarding-next-2");
+
+function setCheck(el, state) {
+  if (!el) return;
+  const icon = el.querySelector(".check-icon");
+  el.classList.remove("ok", "fail");
+  if (state === "ok")   { el.classList.add("ok");   if (icon) icon.textContent = "✓"; }
+  else if (state === "fail") { el.classList.add("fail"); if (icon) icon.textContent = "✗"; }
+  else { if (icon) icon.textContent = "⏳"; }
+}
+
+// Forward setup.sh progress from main process to the log box
+if (bridge.onSetupProgress) {
+  bridge.onSetupProgress((text) => {
+    if (!setupLogEl) return;
+    setupLogEl.textContent = text;
+  });
+}
+
+async function runSetupChecklist() {
+  // Ensure user_id is generated and merged with saved credentials
+  const saved = await bridge.loadCredentials?.() ?? {};
+  if (!saved.user_id) {
+    const idCreds = await bridge.generateUserId?.() ?? {};
+    await bridge.saveCredentials?.({ ...saved, ...idCreds });
+  }
+
+  // Kick off Python setup + backend start
+  setCheck(checkPythonEl, "spin");
+  const startResult = await bridge.startBackend?.() ?? { ok: false };
+  setCheck(checkPythonEl, startResult.ok ? "ok" : "fail");
+
+  // Wait up to 15 seconds for WebSocket to connect
+  setCheck(checkWsEl, "spin");
+  let wsOk = false;
+  for (let i = 0; i < 30; i++) {
+    if (app.ws && app.ws.readyState === WebSocket.OPEN) { wsOk = true; break; }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  setCheck(checkWsEl, wsOk ? "ok" : "fail");
+
+  // Microphone permission check
+  setCheck(checkMicEl, "spin");
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream.getTracks().forEach(t => t.stop());
+    setCheck(checkMicEl, "ok");
+  } catch {
+    setCheck(checkMicEl, "fail");
+  }
+
+  if (next2Btn) next2Btn.disabled = false;
+}
+
+if (next2Btn) {
+  next2Btn.addEventListener("click", () => {
+    onboardingStep2.classList.remove("active");
+    onboardingStep3.classList.add("active");
+  });
+}
+
+// ── Step 3: Shortcuts & Extension ──
+const onboardingDone = document.getElementById("onboarding-done");
 
 if (onboardingDone) {
   onboardingDone.addEventListener("click", () => {
     onboardingOverlay.classList.add("hidden");
     setMouseEnabled(false);
     setState(State.IDLE, { force: true });
+  });
+}
+
+// ── Extension install buttons in onboarding ──
+const exportExtBtn = document.getElementById("onboarding-export-ext");
+const revealExtBtn = document.getElementById("onboarding-reveal-ext");
+
+if (exportExtBtn) {
+  exportExtBtn.addEventListener("click", async () => {
+    exportExtBtn.textContent = "Saving…";
+    exportExtBtn.disabled = true;
+    try {
+      const result = await bridge.exportExtension();
+      if (result?.success) {
+        exportExtBtn.textContent = "✅ Saved! Opening folder…";
+      } else if (result?.reason === "cancelled") {
+        exportExtBtn.textContent = "📥 Save Extension to Downloads";
+      } else {
+        exportExtBtn.textContent = "❌ Failed — try again";
+      }
+    } catch {
+      exportExtBtn.textContent = "❌ Error — try again";
+    }
+    exportExtBtn.disabled = false;
+    setTimeout(() => {
+      exportExtBtn.textContent = "📥 Save Extension to Downloads";
+    }, 3000);
+  });
+}
+
+if (revealExtBtn) {
+  revealExtBtn.addEventListener("click", () => {
+    bridge.revealExtension();
   });
 }
 

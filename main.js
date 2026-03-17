@@ -10,6 +10,8 @@ const {
   ipcMain,
   screen,
   session,
+  shell,
+  dialog,
   systemPreferences,
   safeStorage,
 } = require("electron");
@@ -41,8 +43,28 @@ const BACKEND_PORT = Number(process.env.MOONWALK_BACKEND_PORT || "8000");
 const BRIDGE_PORT = Number(process.env.MOONWALK_BROWSER_BRIDGE_PORT || "8765");
 const BACKEND_READY_SENTINEL = "[Backend] READY";
 
+// Venv lives in userData for packaged builds (writable, survives app updates)
+const getVenvRoot = () => IS_PACKAGED
+  ? path.join(app.getPath("userData"), "venv")
+  : path.join(__dirname, "venv");
+
+// Bundled Picovoice key — enables the "Hey Moonwalk" wake word out of the box.
+// Users can replace this with their own key from console.picovoice.ai
+const BUNDLED_PICOVOICE_KEY = "lDvqq7J641WbqdzMsPCdLlawELhfGZOGhaceFzl3ZYYYzeeuXq55YA==";
+
 // ── Credential storage ──
 const CRED_FILE = path.join(app.getPath("userData"), "credentials.enc");
+
+/**
+ * Check whether we have *usable* saved credentials (file exists,
+ * decrypts successfully, and contains a Gemini API key).
+ * Returns true only when the user can skip onboarding.
+ */
+function hasUsableCredentials() {
+  if (!fs.existsSync(CRED_FILE)) return false;
+  const creds = loadCredentials();          // returns null on any failure
+  return !!(creds && creds.gemini_api_key);
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -79,18 +101,60 @@ async function canReachBackend(timeoutMs = 1500) {
   return backendReady && bridgeReady;
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  Python Environment Setup
+// ═══════════════════════════════════════════════════════════════
+
+function runSetup(venvRoot) {
+  return new Promise((resolve) => {
+    const setupPath = IS_PACKAGED
+      ? path.join(APP_ROOT, "setup.sh")
+      : path.join(__dirname, "setup.sh");
+
+    if (!fs.existsSync(setupPath)) {
+      console.error("[Setup] setup.sh not found at:", setupPath);
+      resolve(false);
+      return;
+    }
+
+    const setup = spawn("bash", [setupPath], {
+      cwd: IS_PACKAGED ? APP_ROOT : __dirname,
+      env: { ...process.env, MOONWALK_VENV_DIR: venvRoot },
+      stdio: "pipe",
+    });
+
+    setup.stdout.on("data", (data) => {
+      const text = data.toString().trim();
+      process.stdout.write(`[Setup] ${text}\n`);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send("setup:progress", text);
+      }
+    });
+
+    setup.stderr.on("data", (data) => {
+      process.stderr.write(`[Setup ERR] ${data.toString()}`);
+    });
+
+    setup.on("close", (code) => {
+      console.log(`[Setup] Exited with code ${code}`);
+      resolve(code === 0);
+    });
+  });
+}
+
 async function startPythonBackend() {
-  // In packaged mode, venv lives next to the app; in dev mode, in project root
-  const venvPythonPath = IS_PACKAGED
-    ? path.join(APP_ROOT, "venv", "bin", "python3")
-    : path.join(__dirname, "venv", "bin", "python3");
+  const venvRoot = getVenvRoot();
+  const venvPythonPath = path.join(venvRoot, "bin", "python3");
   const scriptPath = path.join(BACKEND_ROOT, "servers", "local_server.py");
   const cwd = IS_PACKAGED ? APP_ROOT : __dirname;
 
   if (!fs.existsSync(venvPythonPath)) {
-    console.error(`[Backend] Python executable not found at: ${venvPythonPath}`);
-    console.error("[Backend] Please run: ./setup.sh");
-    return false;
+    console.log("[Backend] Python venv not found — running setup...");
+    const ok = await runSetup(venvRoot);
+    if (!ok) {
+      console.error("[Backend] Setup failed — cannot start backend");
+      return false;
+    }
   }
 
   if (await canReachBackend()) {
@@ -101,10 +165,18 @@ async function startPythonBackend() {
 
   console.log("[Backend] Starting Python server...");
 
+  // Load saved credentials and inject API keys into Python's environment
+  const savedCreds = loadCredentials();
+  const spawnEnv = { ...process.env };
+  if (savedCreds?.gemini_api_key) spawnEnv.GEMINI_API_KEY = savedCreds.gemini_api_key;
+  // Use saved Picovoice key if set, otherwise fall back to the bundled default
+  spawnEnv.PICOVOICE_ACCESS_KEY = savedCreds?.picovoice_key || BUNDLED_PICOVOICE_KEY;
+
   // Start the python process
   pythonProcess = spawn(venvPythonPath, [scriptPath], {
     cwd: cwd,
-    stdio: ['ignore', 'pipe', 'pipe']
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: spawnEnv,
   });
   ownsPythonProcess = true;
 
@@ -272,19 +344,13 @@ function setMousePassthrough(ignore) {
 }
 
 async function configureMicrophonePermissions() {
+  // Allow all permissions for our own renderer (media, clipboard, notifications, etc.)
   session.defaultSession.setPermissionCheckHandler((_, permission) => {
-    if (permission === "media" || permission === "microphone") {
-      return true;
-    }
-    return false;
+    return true;
   });
 
   session.defaultSession.setPermissionRequestHandler((_, permission, callback) => {
-    if (permission === "media" || permission === "microphone") {
-      callback(true);
-      return;
-    }
-    callback(false);
+    callback(true);
   });
 
   if (process.platform === "darwin") {
@@ -302,11 +368,17 @@ async function configureMicrophonePermissions() {
 app.whenReady().then(async () => {
   await configureMicrophonePermissions();
 
-  // Start backend before creating the window
-  await startPythonBackend();
-
+  // Create window first so setup:progress events can reach the renderer
   createWindow();
   registerHotkey();
+
+  // Returning user (credentials valid): start backend immediately with saved API keys.
+  // First launch / corrupt credentials: renderer shows onboarding first.
+  if (hasUsableCredentials()) {
+    // Brief pause for window to finish loading before setup:progress events fire
+    await new Promise(r => setTimeout(r, 800));
+    startPythonBackend();
+  }
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -394,7 +466,7 @@ ipcMain.handle("auth:clear-credentials", () => {
 });
 
 ipcMain.handle("auth:is-first-launch", () => {
-  return !fs.existsSync(CRED_FILE);
+  return !hasUsableCredentials();
 });
 
 ipcMain.handle("app:get-version", () => {
@@ -403,6 +475,76 @@ ipcMain.handle("app:get-version", () => {
 
 ipcMain.handle("app:is-packaged", () => {
   return IS_PACKAGED;
+});
+
+ipcMain.handle("backend:start", async () => {
+  const ok = await startPythonBackend();
+  return { ok };
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  Chrome Extension — Export & Install Helpers
+// ═══════════════════════════════════════════════════════════════
+
+const CHROME_EXT_SOURCE = IS_PACKAGED
+  ? path.join(APP_ROOT, "chrome_extension")
+  : path.join(__dirname, "chrome_extension");
+
+ipcMain.handle("extension:export", async () => {
+  // Let customer choose where to save the extension folder
+  const { canceled, filePath: destPath } = await dialog.showSaveDialog(mainWindow, {
+    title: "Save Moonwalk Browser Extension",
+    defaultPath: path.join(app.getPath("downloads"), "moonwalk-browser-bridge"),
+    buttonLabel: "Save Extension",
+  });
+  if (canceled || !destPath) return { success: false, reason: "cancelled" };
+
+  try {
+    // Copy extension folder to chosen location
+    const { execSync } = require("node:child_process");
+    if (fs.existsSync(destPath)) {
+      execSync(`rm -rf "${destPath}"`);
+    }
+    execSync(`cp -R "${CHROME_EXT_SOURCE}" "${destPath}"`);
+
+    // Write a friendly install guide inside
+    const guide = [
+      "# Moonwalk Browser Bridge — Install Guide\n",
+      "## Quick Install (2 minutes)\n",
+      "1. Open Google Chrome",
+      "2. Go to chrome://extensions",
+      "3. Turn ON 'Developer mode' (top-right toggle)",
+      "4. Click 'Load unpacked' (top-left)",
+      "5. Select THIS folder",
+      "6. Done! The Moonwalk extension is now installed.\n",
+      "## Pin the Extension",
+      "Click the puzzle piece icon in Chrome's toolbar,",
+      "then click the pin next to 'Moonwalk Browser Bridge'.\n",
+      "## Connection",
+      "The extension connects automatically to the Moonwalk desktop app.",
+      "Make sure Moonwalk is running before using browser features.\n",
+    ].join("\n");
+    fs.writeFileSync(path.join(destPath, "INSTALL.md"), guide);
+
+    // Open the folder in Finder
+    shell.showItemInFolder(destPath);
+    return { success: true, path: destPath };
+  } catch (err) {
+    return { success: false, reason: err.message };
+  }
+});
+
+ipcMain.handle("extension:reveal", () => {
+  if (fs.existsSync(CHROME_EXT_SOURCE)) {
+    shell.showItemInFolder(CHROME_EXT_SOURCE);
+    return true;
+  }
+  return false;
+});
+
+ipcMain.handle("extension:open-chrome-extensions", () => {
+  shell.openExternal("https://support.google.com/chrome_webstore/answer/2664769");
+  return true;
 });
 
 app.on("will-quit", () => {

@@ -20,6 +20,9 @@ pyobjc-core>=9.0
 pyobjc-framework-Cocoa>=9.0
 pyobjc-framework-Quartz>=9.0
 
+# ── Voice Output (TTS) ──
+google-cloud-texttospeech>=2.16.0
+
 # ── Utilities ──
 pillow>=10.0.0
 tenacity>=8.0.0

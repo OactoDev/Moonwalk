@@ -9,6 +9,10 @@
     "build": "electron-builder --mac",
     "build:dmg": "electron-builder --mac dmg",
     "build:dir": "electron-builder --mac dir",
+    "build:signed": "electron-builder --mac --universal",
+    "release": "electron-builder --mac --universal --publish never",
+    "dist:upload": "node scripts/upload-gcs.mjs",
+    "dist:extension": "node scripts/package-extension.mjs",
     "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
@@ -26,6 +30,7 @@
       "output": "dist",
       "buildResources": "build"
     },
+    "afterSign": "build/notarize.cjs",
     "files": [
       "main.js",
       "preload.js",
@@ -52,9 +57,18 @@
       {
         "from": "setup.sh",
         "to": "setup.sh"
+      },
+      {
+        "from": "chrome_extension",
+        "to": "chrome_extension",
+        "filter": [
+          "**/*",
+          "!*.bak"
+        ]
       }
     ],
     "mac": {
+      "icon": "build/icon.icns",
       "category": "public.app-category.productivity",
       "target": [
         {
@@ -66,8 +80,11 @@
       ],
       "darkModeSupport": true,
       "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "identity": null,
       "entitlements": "build/entitlements.mac.plist",
-      "entitlementsInherit": "build/entitlements.mac.plist"
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "notarize": false
     },
     "dmg": {
       "title": "Moonwalk",

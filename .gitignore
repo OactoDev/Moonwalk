@@ -5,3 +5,8 @@ __pycache__/
 *.log
 hey_moonwalk.ppn
 .env
+
+dist/
+*.dmg
+*.dmg.blockmap
+scripts/blog-*.html

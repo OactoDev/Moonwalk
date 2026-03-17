@@ -16,6 +16,9 @@ google-cloud-storage>=2.14.0
 # ── Authentication ──
 google-auth>=2.28.0
 
+# ── Voice Output (TTS) ──
+google-cloud-texttospeech>=2.16.0
+
 # ── RAG (Vertex AI embeddings) ──
 # Embeddings are accessed via the google-genai SDK (embed_content)
 # No additional package needed — google-genai handles it.
